@@ -289,6 +289,36 @@ let pendingDeletedUuids = [];  // deleted UUIDs for parentUuid repair
 let showTools = true;
 let showSidechain = false;
 let lastCheckedIndex = null;
+let undoStack = [];
+
+function pushUndo() {
+  undoStack.push({
+    allMessages: JSON.parse(JSON.stringify(allMessages)),
+    deletedUuids: new Set(deletedUuids),
+    pendingInsertLines: [...pendingInsertLines],
+    pendingDeletedUuids: [...pendingDeletedUuids],
+  });
+  if (undoStack.length > 50) undoStack.shift();
+}
+
+function undo() {
+  if (undoStack.length === 0) { setStatus('Nothing to undo.'); return; }
+  const state = undoStack.pop();
+  allMessages = state.allMessages;
+  deletedUuids = state.deletedUuids;
+  pendingInsertLines = state.pendingInsertLines;
+  pendingDeletedUuids = state.pendingDeletedUuids;
+  renderConversation();
+  updateButtons();
+  setStatus(`Undo (${undoStack.length} left)`);
+}
+
+document.addEventListener('keydown', e => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
+    e.preventDefault();
+    undo();
+  }
+});
 
 // Utilities
 function formatSize(bytes) {
@@ -378,6 +408,9 @@ async function loadConversation(sessionId) {
   const messages = document.getElementById('conv-messages');
   messages.innerHTML = '<div class="loading">Loading...</div>';
   deletedUuids = new Set();
+  pendingInsertLines = [];
+  pendingDeletedUuids = [];
+  undoStack = [];
   lastCheckedIndex = null;
 
   const data = await inv('get_conversation', { project_id: currentProject, session_id: sessionId });
@@ -478,6 +511,7 @@ function toggleContent(index) {
 
 // Selection
 function handleCheckboxClick(event, index) {
+  pushUndo();
   const checked = event.target.checked;
   if (event.shiftKey && lastCheckedIndex !== null) {
     const from = Math.min(lastCheckedIndex, index);
@@ -514,6 +548,7 @@ function toggleMessage(index, checked) {
 }
 
 function truncateFrom(index) {
+  pushUndo();
   // Delete all messages from index onwards
   for (let i = index; i < allMessages.length; i++) {
     deletedUuids.add(allMessages[i].uuid);
@@ -527,6 +562,7 @@ function truncateFrom(index) {
 }
 
 function selectAll(checked) {
+  pushUndo();
   allMessages.forEach((_, i) => setMessageChecked(i, checked));
   updateSizeInfo();
   updateButtons();
@@ -768,6 +804,7 @@ async function applyIdealized() {
   if (!jsonStr) return;
   let idealMsgs;
   try { idealMsgs = JSON.parse(jsonStr); } catch(e) { setStatus('Invalid JSON: ' + e); return; }
+  pushUndo();
   hideIdealizeDialog();
 
   // Find first selected message's parentUuid
@@ -856,6 +893,7 @@ function hideSummarizeDialog(e) {
 async function applySummary() {
   const summary = document.getElementById('summarize-ta').value.trim();
   if (!summary) return;
+  pushUndo();
   hideSummarizeDialog();
   setStatus('Applying summary...');
   try {
@@ -932,6 +970,7 @@ function updateButtons() {
 }
 
 function deleteSelected() {
+  pushUndo();
   // Visually hide deleted messages (not saved yet)
   deletedUuids.forEach(uuid => {
     const el = document.querySelector(`[data-uuid="${uuid}"]`);
