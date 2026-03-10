@@ -1120,6 +1120,7 @@ func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt st
 	}
 
 	var finalResult string
+	var allLines []string
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -1127,6 +1128,7 @@ func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt st
 		if line == "" {
 			continue
 		}
+		allLines = append(allLines, line)
 		var event map[string]json.RawMessage
 		if json.Unmarshal([]byte(line), &event) != nil {
 			continue
@@ -1136,14 +1138,18 @@ func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt st
 
 		switch evType {
 		case "assistant":
-			// streaming content delta — emit token to frontend
 			if ctx != nil {
 				runtime.EventsEmit(ctx, "claude:stream", line)
 			}
 		case "result":
-			var result string
-			json.Unmarshal(event["result"], &result)
-			finalResult = result
+			// result may be a string or an object
+			raw := event["result"]
+			var s string
+			if json.Unmarshal(raw, &s) == nil {
+				finalResult = s
+			} else {
+				finalResult = string(raw)
+			}
 		}
 	}
 
@@ -1152,6 +1158,9 @@ func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt st
 			return "", fmt.Errorf("%s", se)
 		}
 		return "", err
+	}
+	if finalResult == "" && len(allLines) > 0 {
+		return "", fmt.Errorf("no result event found. last lines: %s", allLines[len(allLines)-1])
 	}
 	return strings.TrimSpace(finalResult), nil
 }
