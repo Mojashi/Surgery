@@ -746,21 +746,15 @@ func (a *App) BranchNewSession(projectID, sessionID, fromUUID string) (string, e
 	return newID, nil
 }
 
-// SummarizeMessages calls `claude -p` to summarize the selected messages.
-func (a *App) SummarizeMessages(projectID, sessionID string, uuids []string) (string, error) {
-	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+// extractSelectedMessages returns raw message objects (role+content) for selected UUIDs, in file order.
+func extractSelectedMessages(path string, uuidSet map[string]bool) ([]map[string]json.RawMessage, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer f.Close()
 
-	uuidSet := make(map[string]bool, len(uuids))
-	for _, u := range uuids {
-		uuidSet[u] = true
-	}
-
-	var parts []string
+	var msgs []map[string]json.RawMessage
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -768,37 +762,232 @@ func (a *App) SummarizeMessages(projectID, sessionID string, uuids []string) (st
 		if json.Unmarshal(scanner.Bytes(), &d) != nil {
 			continue
 		}
-		var uuid, t string
+		var uuid string
 		json.Unmarshal(d["uuid"], &uuid)
-		json.Unmarshal(d["type"], &t)
 		if !uuidSet[uuid] {
 			continue
 		}
 		var msg map[string]json.RawMessage
 		json.Unmarshal(d["message"], &msg)
-		var role string
-		json.Unmarshal(msg["role"], &role)
+		msgs = append(msgs, msg)
+	}
+	return msgs, nil
+}
 
-		text := extractText(msg["content"])
-		if text != "" {
-			parts = append(parts, role+": "+text)
-		} else {
-			parts = append(parts, role+": [no text]")
-		}
+// SummarizeMessages calls `claude -p` to summarize the selected messages.
+func (a *App) SummarizeMessages(projectID, sessionID string, uuids []string) (string, error) {
+	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	uuidSet := make(map[string]bool, len(uuids))
+	for _, u := range uuids {
+		uuidSet[u] = true
+	}
+	msgs, err := extractSelectedMessages(path, uuidSet)
+	if err != nil {
+		return "", err
+	}
+	if len(msgs) == 0 {
+		return "", fmt.Errorf("no selected messages found")
 	}
 
-	if len(parts) == 0 {
-		return "", fmt.Errorf("no selected messages found")
+	var parts []string
+	for _, msg := range msgs {
+		var role string
+		json.Unmarshal(msg["role"], &role)
+		text := extractText(msg["content"])
+		if text == "" {
+			text = "[no text]"
+		}
+		parts = append(parts, role+": "+text)
 	}
 
 	prompt := "以下の会話を簡潔にサマリーしてください。重要な決定・発見・コンテキストを保持してください。サマリーのみ出力してください。\n\n" +
 		strings.Join(parts, "\n\n")
 
-	out, err := runClaude(prompt)
+	out, err := runClaude(prompt, "")
 	if err != nil {
 		return "", fmt.Errorf("claude failed: %w", err)
 	}
 	return strings.TrimSpace(out), nil
+}
+
+var idealizeSchema = `{"type":"object","properties":{"messages":{"type":"array","items":{"type":"object","properties":{"role":{"type":"string","enum":["user","assistant"]},"content":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string","enum":["text","tool_use","tool_result"]},"text":{"type":"string"},"id":{"type":"string"},"name":{"type":"string"},"input":{"type":"object"},"tool_use_id":{"type":"string"},"content":{"type":"string"}},"required":["type"]}}},"required":["role","content"]}}},"required":["messages"]}`
+
+const idealizeSystemPrompt = `You are rewriting a conversation to its ideal form — the version that would have occurred if everything went perfectly on the first try.
+
+Rules:
+- Remove all errors, failed attempts, retries, and unnecessary detours
+- The correct approach is taken immediately every time
+- Tool calls return correct results on the first try (regenerate realistic tool_result content)
+- Keep all semantically important exchanges; remove only waste
+- Preserve the overall goal and outcome
+- Output ONLY the idealized messages array in the required JSON format`
+
+// IdealizeMessages generates an idealized version of the selected messages using claude.
+// Returns JSON string of the idealized messages array.
+func (a *App) IdealizeMessages(projectID, sessionID string, uuids []string) (string, error) {
+	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	uuidSet := make(map[string]bool, len(uuids))
+	for _, u := range uuids {
+		uuidSet[u] = true
+	}
+	msgs, err := extractSelectedMessages(path, uuidSet)
+	if err != nil {
+		return "", err
+	}
+	if len(msgs) == 0 {
+		return "", fmt.Errorf("no selected messages found")
+	}
+
+	// Serialize messages as JSON for the prompt
+	msgsJSON, _ := json.MarshalIndent(msgs, "", "  ")
+	prompt := "以下の会話を理想の形に書き直してください:\n\n" + string(msgsJSON)
+
+	out, err := runClaude(prompt, idealizeSchema)
+	if err != nil {
+		return "", fmt.Errorf("claude failed: %w", err)
+	}
+
+	// Extract the messages array from the response object
+	var wrapper struct {
+		Messages json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(out), &wrapper); err != nil {
+		return "", fmt.Errorf("parse failed: %w\nraw: %s", err, out)
+	}
+	return string(wrapper.Messages), nil
+}
+
+// ApplyIdealized creates a new session replacing the selected range with idealized messages.
+// Returns the new session ID.
+func (a *App) ApplyIdealized(projectID, sessionID string, uuids []string, messagesJSON string) (string, error) {
+	// Parse idealized messages
+	var idealMsgs []struct {
+		Role    string            `json:"role"`
+		Content json.RawMessage   `json:"content"`
+	}
+	if err := json.Unmarshal([]byte(messagesJSON), &idealMsgs); err != nil {
+		return "", fmt.Errorf("invalid messages JSON: %w", err)
+	}
+
+	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	f.Close()
+
+	uuidSet := make(map[string]bool, len(uuids))
+	for _, u := range uuids {
+		uuidSet[u] = true
+	}
+
+	// Find parentUuid of first selected message
+	var firstParentUUID string
+	for _, line := range lines {
+		var d map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &d) != nil {
+			continue
+		}
+		var uuid string
+		json.Unmarshal(d["uuid"], &uuid)
+		if uuidSet[uuid] {
+			json.Unmarshal(d["parentUuid"], &firstParentUUID)
+			break
+		}
+	}
+
+	// Generate UUIDs for idealized messages and build JSONL lines
+	type idealLine struct {
+		uuid string
+		line string
+	}
+	var idealLines []idealLine
+	prevUUID := firstParentUUID
+	for _, im := range idealMsgs {
+		b := make([]byte, 16)
+		rand.Read(b)
+		newUUID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+
+		msgBytes, _ := json.Marshal(map[string]interface{}{
+			"role":    im.Role,
+			"content": im.Content,
+		})
+		d := map[string]interface{}{
+			"uuid":       newUUID,
+			"parentUuid": prevUUID,
+			"type":       im.Role,
+			"timestamp":  "2006-01-02T15:04:05.000Z",
+			"message":    json.RawMessage(msgBytes),
+		}
+		lineBytes, _ := json.Marshal(d)
+		idealLines = append(idealLines, idealLine{uuid: newUUID, line: string(lineBytes)})
+		prevUUID = newUUID
+	}
+
+	lastIdealUUID := prevUUID
+
+	// Build new session: pre-selection + idealized + post-selection
+	var outLines []string
+	inSelection := false
+	passedSelection := false
+	firstPostFixed := false
+	for _, line := range lines {
+		var d map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &d) != nil {
+			outLines = append(outLines, line)
+			continue
+		}
+		var uuid string
+		json.Unmarshal(d["uuid"], &uuid)
+
+		if uuidSet[uuid] {
+			if !inSelection {
+				inSelection = true
+				// Insert idealized messages here
+				for _, il := range idealLines {
+					outLines = append(outLines, il.line)
+				}
+			}
+			passedSelection = true
+			continue // skip original selected messages
+		}
+
+		if passedSelection && !firstPostFixed {
+			// Fix parentUuid of first post-selection message
+			var parent string
+			json.Unmarshal(d["parentUuid"], &parent)
+			if uuidSet[parent] {
+				d["parentUuid"], _ = json.Marshal(lastIdealUUID)
+				fixed, _ := json.Marshal(d)
+				outLines = append(outLines, string(fixed))
+				firstPostFixed = true
+				continue
+			}
+		}
+		outLines = append(outLines, line)
+	}
+	_ = inSelection
+
+	// Write new session
+	b := make([]byte, 16)
+	rand.Read(b)
+	newID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	dst := filepath.Join(claudeDir(), projectID, newID+".jsonl")
+	out, err := os.Create(dst)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range outLines {
+		fmt.Fprintln(out, line)
+	}
+	out.Close()
+	return newID, nil
 }
 
 func extractText(content json.RawMessage) string {
@@ -858,12 +1047,18 @@ func extractText(content json.RawMessage) string {
 
 const summarizeSystemPrompt = `You are a conversation summarizer. Output only a concise summary of the conversation provided. Do not use any tools. Do not ask questions. Output the summary text directly with no preamble.`
 
-func runClaude(prompt string) (string, error) {
-	cmd := exec.Command("claude", "-p",
-		"--output-format", "json",
-		"--system-prompt", summarizeSystemPrompt,
-		prompt,
-	)
+// runClaude calls claude -p with --output-format json.
+// If jsonSchema is non-empty, --json-schema is passed and result is parsed as JSON.
+func runClaude(prompt, jsonSchema string) (string, error) {
+	args := []string{"-p", "--output-format", "json", "--effort", "low"}
+	if jsonSchema != "" {
+		args = append(args, "--json-schema", jsonSchema)
+	} else {
+		args = append(args, "--system-prompt", summarizeSystemPrompt)
+	}
+	args = append(args, prompt)
+
+	cmd := exec.Command("claude", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
@@ -878,7 +1073,6 @@ func runClaude(prompt string) (string, error) {
 		Error  string `json:"error"`
 	}
 	if err := json.Unmarshal(out, &result); err != nil {
-		// Fallback: treat raw output as text
 		return strings.TrimSpace(string(out)), nil
 	}
 	if result.Error != "" {

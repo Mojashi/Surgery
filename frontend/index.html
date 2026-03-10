@@ -161,6 +161,7 @@
       <button class="btn btn-default" onclick="loadConversation(currentSession)" title="Reload conversation">↺</button>
       <div class="spacer"></div>
       <button class="btn btn-default" onclick="showExecDialog()">▶ Exec</button>
+      <button class="btn btn-default" id="idealize-btn" onclick="startIdealize()" disabled>✨ Idealize</button>
       <button class="btn btn-default" id="summarize-btn" onclick="startSummarize()" disabled>⚗ Summarize</button>
       <button class="btn btn-danger" id="delete-btn" onclick="deleteSelected()" disabled>Delete Selected</button>
       <button class="btn btn-success" id="save-btn" onclick="showSaveDialog()" disabled>Save</button>
@@ -220,6 +221,19 @@
   </div>
 </div>
 
+<!-- Idealize dialog -->
+<div class="overlay" id="idealize-overlay" onclick="hideIdealizeDialog(event)">
+  <div class="dialog" style="min-width:600px;max-width:800px" onclick="event.stopPropagation()">
+    <h2>✨ Idealize</h2>
+    <p id="idealize-desc" style="margin-bottom:12px;font-size:13px;color:#8b949e"></p>
+    <textarea id="idealize-ta" class="edit-area" style="min-height:240px;font-size:11px;font-family:monospace"></textarea>
+    <div class="dialog-actions">
+      <button class="btn btn-default" onclick="hideIdealizeDialog()">Cancel</button>
+      <button class="btn btn-success" id="idealize-apply-btn" onclick="applyIdealized()" disabled>Apply as new session</button>
+    </div>
+  </div>
+</div>
+
 <!-- Summarize dialog -->
 <div class="overlay" id="summarize-overlay" onclick="hideSummarizeDialog(event)">
   <div class="dialog" style="min-width:520px;max-width:700px" onclick="event.stopPropagation()">
@@ -247,6 +261,8 @@ async function inv(cmd, args) {
     if (cmd === 'restore_sidechain') return go.RestoreSidechain(args.project_id, args.session_id, args.uuid);
     if (cmd === 'summarize_messages') return go.SummarizeMessages(args.project_id, args.session_id, args.uuids);
     if (cmd === 'apply_summary') return go.ApplySummary(args.project_id, args.session_id, args.uuids, args.summary);
+    if (cmd === 'idealize_messages') return go.IdealizeMessages(args.project_id, args.session_id, args.uuids);
+    if (cmd === 'apply_idealized') return go.ApplyIdealized(args.project_id, args.session_id, args.uuids, args.messages_json);
     if (cmd === 'exec_claude') return go.ExecClaude(args.project_id, args.skip_permissions);
     if (cmd === 'insert_message') return go.InsertMessage(args.project_id, args.session_id, args.after_uuid, args.role, args.text);
   }
@@ -663,6 +679,63 @@ async function execClaude() {
   }
 }
 
+let pendingIdealizeUuids = [];
+
+async function startIdealize() {
+  if (deletedUuids.size === 0) return;
+  pendingIdealizeUuids = [...deletedUuids];
+  document.getElementById('idealize-desc').textContent =
+    `${pendingIdealizeUuids.length} messages selected. Generating idealized conversation...`;
+  document.getElementById('idealize-ta').value = '';
+  document.getElementById('idealize-apply-btn').disabled = true;
+  document.getElementById('idealize-overlay').classList.add('show');
+  setStatus('Idealizing with Claude...');
+  try {
+    const json = await inv('idealize_messages', {
+      project_id: currentProject,
+      session_id: currentSession,
+      uuids: pendingIdealizeUuids,
+    });
+    document.getElementById('idealize-ta').value = JSON.stringify(JSON.parse(json), null, 2);
+    document.getElementById('idealize-desc').textContent =
+      `Generated idealized conversation. Edit if needed, then apply as a new session.`;
+    document.getElementById('idealize-apply-btn').disabled = false;
+    setStatus('Idealization ready.');
+  } catch(e) {
+    document.getElementById('idealize-desc').textContent = 'Error: ' + e;
+    setStatus('Idealize failed: ' + e);
+  }
+}
+
+function hideIdealizeDialog(e) {
+  if (e && e.target !== document.getElementById('idealize-overlay')) return;
+  document.getElementById('idealize-overlay').classList.remove('show');
+}
+
+async function applyIdealized() {
+  const json = document.getElementById('idealize-ta').value.trim();
+  if (!json) return;
+  // Validate JSON
+  try { JSON.parse(json); } catch(e) { setStatus('Invalid JSON: ' + e); return; }
+  hideIdealizeDialog();
+  setStatus('Creating new session...');
+  try {
+    const newSessionId = await inv('apply_idealized', {
+      project_id: currentProject,
+      session_id: currentSession,
+      uuids: pendingIdealizeUuids,
+      messages_json: json,
+    });
+    deletedUuids = new Set();
+    setStatus('New session created. Reloading...');
+    await loadSessions(currentProject);
+    const el = document.querySelector(`#session-list [data-id="${newSessionId}"]`);
+    if (el) { el.classList.add('active'); await selectSession(newSessionId, el); }
+  } catch(e) {
+    setStatus('Apply failed: ' + e);
+  }
+}
+
 let pendingSummaryUuids = [];
 
 async function startSummarize() {
@@ -771,6 +844,7 @@ function updateButtons() {
   document.getElementById('delete-btn').disabled = !hasDeleted;
   document.getElementById('save-btn').disabled = !hasDeleted;
   document.getElementById('summarize-btn').disabled = !hasDeleted;
+  document.getElementById('idealize-btn').disabled = !hasDeleted;
 }
 
 function deleteSelected() {
