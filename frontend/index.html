@@ -158,6 +158,7 @@
       <button class="btn btn-default" onclick="toggleSidechain()">Sidechain</button>
       <button class="btn btn-default" onclick="loadConversation(currentSession)" title="Reload conversation">↺</button>
       <div class="spacer"></div>
+      <button class="btn btn-default" onclick="showExecDialog()">▶ Exec</button>
       <button class="btn btn-default" id="summarize-btn" onclick="startSummarize()" disabled>⚗ Summarize</button>
       <button class="btn btn-danger" id="delete-btn" onclick="deleteSelected()" disabled>Delete Selected</button>
       <button class="btn btn-success" id="save-btn" onclick="showSaveDialog()" disabled>Save</button>
@@ -177,6 +178,22 @@
     <div class="dialog-actions">
       <button class="btn btn-default" onclick="hideSaveDialog()">Cancel</button>
       <button class="btn btn-success" onclick="executeSave()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Exec dialog -->
+<div class="overlay" id="exec-overlay" onclick="hideExecDialog(event)">
+  <div class="dialog" style="min-width:360px" onclick="event.stopPropagation()">
+    <h2>▶ Exec Claude Code</h2>
+    <p style="margin:12px 0;font-size:13px;color:#8b949e" id="exec-path"></p>
+    <label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;padding:10px;background:#0d1117;border-radius:6px">
+      <input type="checkbox" id="exec-skip-perms" style="width:14px;height:14px;accent-color:#f85149">
+      <span><code style="color:#f85149">--dangerously-skip-permissions</code></span>
+    </label>
+    <div class="dialog-actions">
+      <button class="btn btn-default" onclick="hideExecDialog()">Cancel</button>
+      <button class="btn btn-success" onclick="execClaude()">Launch</button>
     </div>
   </div>
 </div>
@@ -208,6 +225,7 @@ async function inv(cmd, args) {
     if (cmd === 'restore_sidechain') return go.RestoreSidechain(args.project_id, args.session_id, args.uuid);
     if (cmd === 'summarize_messages') return go.SummarizeMessages(args.project_id, args.session_id, args.uuids);
     if (cmd === 'apply_summary') return go.ApplySummary(args.project_id, args.session_id, args.uuids, args.summary);
+    if (cmd === 'exec_claude') return go.ExecClaude(args.project_id, args.skip_permissions);
   }
   // fallback fetch for dev
   const map = {
@@ -557,6 +575,30 @@ async function commitEdit(index) {
     setStatus('Edit saved.');
   } catch(e) {
     setStatus('Edit failed: ' + e);
+  }
+}
+
+function showExecDialog() {
+  if (!currentProject) return;
+  const path = '/' + currentProject.replace(/-/g, '/').replace(/^\//, '');
+  document.getElementById('exec-path').textContent = path;
+  document.getElementById('exec-skip-perms').checked = false;
+  document.getElementById('exec-overlay').classList.add('show');
+}
+
+function hideExecDialog(e) {
+  if (e && e.target !== document.getElementById('exec-overlay')) return;
+  document.getElementById('exec-overlay').classList.remove('show');
+}
+
+async function execClaude() {
+  const skip = document.getElementById('exec-skip-perms').checked;
+  hideExecDialog();
+  try {
+    await inv('exec_claude', { project_id: currentProject, skip_permissions: skip });
+    setStatus('Launched Claude Code in Terminal.');
+  } catch(e) {
+    setStatus('Exec failed: ' + e);
   }
 }
 

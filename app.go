@@ -587,6 +587,23 @@ func (a *App) setSidechainFrom(projectID, sessionID, fromUUID string, toSidechai
 	return nil
 }
 
+func projectIDToPath(id string) string {
+	return "/" + strings.ReplaceAll(strings.TrimPrefix(id, "-"), "-", "/")
+}
+
+func (a *App) ExecClaude(projectID string, skipPermissions bool) error {
+	dir := projectIDToPath(projectID)
+	claudeCmd := "claude"
+	if skipPermissions {
+		claudeCmd = "claude --dangerously-skip-permissions"
+	}
+	script := fmt.Sprintf("cd %s && %s", dir, claudeCmd)
+	return exec.Command("osascript",
+		"-e", `tell application "Terminal" to activate`,
+		"-e", fmt.Sprintf(`tell application "Terminal" to do script %q`, script),
+	).Run()
+}
+
 func (a *App) BranchFrom(projectID, sessionID, fromUUID string) error {
 	return a.setSidechainFrom(projectID, sessionID, fromUUID, true)
 }
