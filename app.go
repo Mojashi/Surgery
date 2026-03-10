@@ -857,9 +857,12 @@ func extractText(content json.RawMessage) string {
 }
 
 func runClaude(prompt string) (string, error) {
-	cmd := exec.Command("claude", "-p", "--dangerously-skip-permissions", prompt)
+	cmd := exec.Command("claude", "-p", prompt)
 	out, err := cmd.Output()
 	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+			return "", fmt.Errorf("exit status 1: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
 		return "", err
 	}
 	return string(out), nil
