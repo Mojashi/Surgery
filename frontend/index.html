@@ -952,55 +952,45 @@ async function restoreSidechain(index) {
 }
 
 function computeWasteScore(msg) {
+  // Returns score: -1 (productive) → 0 (neutral) → +1 (wasteful)
   const cs = msg.content_summary;
   const types = cs?.types || [];
   const raw = msg.raw?.message?.content;
+  const size = cs?.size || 0;
 
-  let score = 0; // 0=efficient, 1=max waste
-  let label = '';
   const progressTools = ['Write', 'Edit', 'NotebookEdit', 'write', 'edit'];
-  const readTools = ['Read', 'Glob', 'Grep', 'Bash', 'read', 'glob', 'grep', 'bash'];
+
+  let score = 0;
+  let label = 'text';
 
   if (Array.isArray(raw)) {
-    let hasError = false, hasProgress = false, hasRead = false;
+    let hasError = false, hasProgress = false;
     for (const b of raw) {
       if (b.type === 'tool_result' && b.is_error) hasError = true;
-      if (b.type === 'tool_use') {
-        if (progressTools.some(t => (b.name || '').includes(t))) hasProgress = true;
-        else if (readTools.some(t => (b.name || '').includes(t))) hasRead = true;
-      }
+      if (b.type === 'tool_use' && progressTools.some(t => (b.name || '').includes(t))) hasProgress = true;
     }
     if (hasError) { score = 1.0; label = 'error'; }
-    else if (hasProgress) { score = 0.0; label = 'write'; }
-    else if (hasRead) { score = 0.3; label = 'read'; }
-  }
-
-  if (!label) {
-    const isToolOnly = types.length > 0 && types.every(t => t === 'tool_use' || t === 'tool_result');
-    if (isToolOnly) {
-      score = 0.5;
-      label = 'tool';
-    } else if (types.includes('thinking')) {
-      score = 0.3;
-      label = 'thinking';
-    } else {
-      score = 0.1;
-      label = 'text';
+    else if (hasProgress) { score = -1.0; label = 'write'; }
+    else {
+      const isToolOnly = types.length > 0 && types.every(t => t === 'tool_use' || t === 'tool_result');
+      if (isToolOnly) { score = 0.4; label = 'tool'; }
     }
   }
 
-  const size = cs?.size || 0;
-  if (size > 5000 && label !== 'write') score = Math.min(1, score + 0.2);
+  if (label === 'text' && types.includes('thinking')) { score = 0.1; label = 'thinking'; }
+
+  // Large tool-only messages = more wasteful
+  if (score > 0 && size > 5000) score = Math.min(1, score + 0.2);
 
   return { score, label, size };
 }
 
-function wasteColor(score, label) {
-  if (score >= 0.8) return '#f85149';  // error
-  if (score >= 0.5) return '#d29922';  // trial-and-error
-  if (label === 'write') return '#1f6feb'; // progress (blue)
-  if (score >= 0.3) return '#3fb950';  // read/thinking
-  return '#238636';                     // text
+function wasteColor(score) {
+  // score: -1 (productive/blue) → 0 (neutral/gray) → 1 (wasteful/red)
+  const r = score > 0 ? Math.round(31 + 217 * score) : Math.round(31 - 0 * score);
+  const g = score > 0 ? Math.round(81 - 30 * score) : Math.round(81 + 30 * (-score));
+  const b = score > 0 ? Math.round(88 - 15 * score) : Math.round(88 + 147 * (-score));
+  return `rgb(${Math.min(255,r)},${Math.min(255,g)},${Math.min(255,b)})`;
 }
 
 function renderHeatmap() {
@@ -1010,7 +1000,7 @@ function renderHeatmap() {
 
   container.innerHTML = allMessages.map((msg, i) => {
     const w = computeWasteScore(msg);
-    const color = wasteColor(w.score, w.label);
+    const color = wasteColor(w.score);
     const deleted = deletedUuids.has(msg.uuid);
     const opacity = deleted ? 0.2 : 1;
     return `<div class="conv-heatmap-cell" style="background:${color};opacity:${opacity}" onclick="scrollToMsg(${i})"><span class="tooltip">#${i+1} ${msg.role} · ${w.label} · ${formatSize(w.size)}</span></div>`;
