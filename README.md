@@ -9,14 +9,11 @@ Claude Code の会話履歴（JSONL）を編集するネイティブアプリ。
 [Releases](https://github.com/Mojashi/claude-conversation-editor/releases) から最新の `surgery-darwin-arm64.zip`（Apple Silicon）または `surgery-darwin-amd64.zip`（Intel）をダウンロードして展開。
 
 ```bash
-# ~/bin に配置する場合
+# アプリをインストール
 cp -r surgery.app /Applications/
-```
 
-`surgery` コマンドとして使うにはシェルスクリプトも同梱:
-
-```bash
-ln -sf /path/to/surgery.sh ~/bin/surgery
+# surgery コマンドを PATH に追加（バイナリに直接リンク）
+ln -sf /Applications/surgery.app/Contents/MacOS/surgery ~/bin/surgery
 ```
 
 ## 使い方

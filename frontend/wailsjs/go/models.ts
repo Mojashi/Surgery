@@ -169,6 +169,38 @@ export namespace main {
 	        this.mtime = source["mtime"];
 	    }
 	}
+	export class StartupArgs {
+	    project: string;
+	    session: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new StartupArgs(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.project = source["project"];
+	        this.session = source["session"];
+	    }
+	}
+	export class UpdateInfo {
+	    current_version: string;
+	    latest_version: string;
+	    has_update: boolean;
+	    download_url: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpdateInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.current_version = source["current_version"];
+	        this.latest_version = source["latest_version"];
+	        this.has_update = source["has_update"];
+	        this.download_url = source["download_url"];
+	    }
+	}
 
 }
 

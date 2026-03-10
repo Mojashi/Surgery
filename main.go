@@ -1,8 +1,16 @@
 package main
 
 import (
+	"crypto/rand"
 	"embed"
+	"encoding/hex"
+	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -13,16 +21,123 @@ import (
 var assets embed.FS
 
 func main() {
-	app := NewApp()
+	args := os.Args[1:]
 
-	// Parse CLI args: cc-editor [project_id] [session_id]
-	if len(os.Args) >= 3 {
-		app.startupProject = os.Args[1]
-		app.startupSession = os.Args[2]
+	switch {
+	case len(args) >= 1 && args[0] == "--open":
+		// Open Wails window, optionally with a specific session
+		runGUI(argStr(args, 1), argStr(args, 2))
+
+	case len(args) >= 1 && args[0] == "--watch":
+		// Background: grep for token, then open window
+		runWatch(argStr(args, 1), argStr(args, 2), argStr(args, 3))
+
+	default:
+		// CLI entry: output token, start watcher in background, exit
+		runSurgery()
 	}
+}
+
+func argStr(args []string, i int) string {
+	if i < len(args) {
+		return args[i]
+	}
+	return ""
+}
+
+func runSurgery() {
+	b := make([]byte, 8)
+	rand.Read(b)
+	token := "SURGERY_" + strings.ToUpper(hex.EncodeToString(b))
+	fmt.Println(token)
+
+	cwd, _ := os.Getwd()
+	projectID := "-" + strings.ReplaceAll(strings.TrimPrefix(cwd, "/"), "/", "-")
+	projectDir := filepath.Join(os.Getenv("HOME"), ".claude", "projects", projectID)
+
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "--watch", token, projectDir, projectID)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	cmd.Start()
+	cmd.Process.Release()
+	os.Exit(0)
+}
+
+func runWatch(token, projectDir, projectID string) {
+	// Wait for JSONL to be written with our token (after parent bash exits)
+	var jsonlPath string
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		jsonlPath = findJSONLWithToken(token, projectDir)
+		if jsonlPath != "" {
+			break
+		}
+	}
+	if jsonlPath == "" {
+		// Fallback: most recently modified JSONL
+		jsonlPath = mostRecentJSONL(projectDir)
+	}
+	if jsonlPath == "" {
+		return
+	}
+	sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
+
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "--open", projectID, sessionID)
+	cmd.Start()
+}
+
+func findJSONLWithToken(token, projectDir string) string {
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".jsonl" {
+			continue
+		}
+		path := filepath.Join(projectDir, e.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), token) {
+			return path
+		}
+	}
+	return ""
+}
+
+func mostRecentJSONL(projectDir string) string {
+	entries, err := os.ReadDir(projectDir)
+	if err != nil {
+		return ""
+	}
+	var latest string
+	var latestTime time.Time
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) != ".jsonl" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(latestTime) {
+			latestTime = info.ModTime()
+			latest = filepath.Join(projectDir, e.Name())
+		}
+	}
+	return latest
+}
+
+func runGUI(startupProject, startupSession string) {
+	app := NewApp()
+	app.startupProject = startupProject
+	app.startupSession = startupSession
 
 	err := wails.Run(&options.App{
-		Title:  "Claude Code Conversation Editor",
+		Title:  "Surgery",
 		Width:  1400,
 		Height: 900,
 		AssetServer: &assetserver.Options{
@@ -34,7 +149,6 @@ func main() {
 			app,
 		},
 	})
-
 	if err != nil {
 		println("Error:", err.Error())
 	}
