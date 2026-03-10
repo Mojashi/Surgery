@@ -604,6 +604,92 @@ func (a *App) ExecClaude(projectID string, skipPermissions bool) error {
 	).Run()
 }
 
+// InsertMessage inserts a new message immediately after afterUUID.
+// The message after afterUUID gets its parentUuid updated to the new message.
+func (a *App) InsertMessage(projectID, sessionID, afterUUID, role, text string) error {
+	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	f.Close()
+
+	// Generate new UUID
+	b := make([]byte, 16)
+	rand.Read(b)
+	newUUID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+
+	// Build new message line
+	msgContent, _ := json.Marshal(text)
+	newMsg := map[string]interface{}{
+		"role":    role,
+		"content": json.RawMessage(msgContent),
+	}
+	msgBytes, _ := json.Marshal(newMsg)
+	newLine := map[string]interface{}{
+		"uuid":       newUUID,
+		"parentUuid": afterUUID,
+		"type":       role,
+		"timestamp":  "2006-01-02T15:04:05.000Z",
+		"message":    json.RawMessage(msgBytes),
+	}
+	newLineBytes, _ := json.Marshal(newLine)
+
+	// Insert after afterUUID, update next message's parentUuid
+	var out []string
+	for _, line := range lines {
+		out = append(out, line)
+		var d map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &d) != nil {
+			continue
+		}
+		var uuid string
+		json.Unmarshal(d["uuid"], &uuid)
+		if uuid == afterUUID {
+			out = append(out, string(newLineBytes))
+		}
+	}
+
+	// Update any message whose parentUuid == afterUUID (except our new one) to point to newUUID
+	// Only update the first one found (the direct child in the main chain)
+	updatedChild := false
+	for i, line := range out {
+		var d map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &d) != nil {
+			continue
+		}
+		var uuid, parent string
+		json.Unmarshal(d["uuid"], &uuid)
+		json.Unmarshal(d["parentUuid"], &parent)
+		if uuid == newUUID {
+			continue // skip our inserted message
+		}
+		if parent == afterUUID && !updatedChild {
+			d["parentUuid"], _ = json.Marshal(newUUID)
+			fixed, _ := json.Marshal(d)
+			out[i] = string(fixed)
+			updatedChild = true
+		}
+	}
+
+	outFile, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	for _, line := range out {
+		fmt.Fprintln(outFile, line)
+	}
+	outFile.Close()
+	return nil
+}
+
 func (a *App) BranchFrom(projectID, sessionID, fromUUID string) error {
 	return a.setSidechainFrom(projectID, sessionID, fromUUID, true)
 }

@@ -82,6 +82,8 @@
   .edit-btn:hover { border-color: #58a6ff; color: #58a6ff; background: #0d1f3a; }
   .branch-btn { padding: 2px 8px; font-size: 10px; border: 1px solid #30363d; border-radius: 4px; background: transparent; color: #8b949e; cursor: pointer; }
   .branch-btn:hover { border-color: #a371f7; color: #a371f7; background: #1a0f2e; }
+  .insert-btn { padding: 2px 8px; font-size: 10px; border: 1px solid #30363d; border-radius: 4px; background: transparent; color: #8b949e; cursor: pointer; }
+  .insert-btn:hover { border-color: #58a6ff; color: #58a6ff; background: #0d1f3a; }
   .restore-btn { padding: 2px 8px; font-size: 10px; border: 1px solid #a371f7; border-radius: 4px; background: #1a0f2e; color: #a371f7; cursor: pointer; }
   .restore-btn:hover { background: #220f3a; }
   .edit-area { width: 100%; min-height: 120px; background: #0d1117; border: 1px solid #58a6ff; border-radius: 6px; color: #e6edf3; font-size: 12px; line-height: 1.6; padding: 8px; font-family: inherit; resize: vertical; }
@@ -182,6 +184,26 @@
   </div>
 </div>
 
+<!-- Insert dialog -->
+<div class="overlay" id="insert-overlay" onclick="hideInsertDialog(event)">
+  <div class="dialog" style="min-width:520px;max-width:700px" onclick="event.stopPropagation()">
+    <h2>+ Insert Message</h2>
+    <div style="display:flex;gap:8px;margin:12px 0">
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #30363d;font-size:12px">
+        <input type="radio" name="insert-role" value="user" checked> <span style="color:#79c0ff">user</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;padding:6px 12px;border-radius:6px;border:1px solid #30363d;font-size:12px">
+        <input type="radio" name="insert-role" value="assistant"> <span style="color:#56d364">assistant</span>
+      </label>
+    </div>
+    <textarea id="insert-ta" class="edit-area" style="min-height:160px" placeholder="Message content..."></textarea>
+    <div class="dialog-actions">
+      <button class="btn btn-default" onclick="hideInsertDialog()">Cancel</button>
+      <button class="btn btn-success" onclick="commitInsert()">Insert</button>
+    </div>
+  </div>
+</div>
+
 <!-- Exec dialog -->
 <div class="overlay" id="exec-overlay" onclick="hideExecDialog(event)">
   <div class="dialog" style="min-width:360px" onclick="event.stopPropagation()">
@@ -226,6 +248,7 @@ async function inv(cmd, args) {
     if (cmd === 'summarize_messages') return go.SummarizeMessages(args.project_id, args.session_id, args.uuids);
     if (cmd === 'apply_summary') return go.ApplySummary(args.project_id, args.session_id, args.uuids, args.summary);
     if (cmd === 'exec_claude') return go.ExecClaude(args.project_id, args.skip_permissions);
+    if (cmd === 'insert_message') return go.InsertMessage(args.project_id, args.session_id, args.after_uuid, args.role, args.text);
   }
   // fallback fetch for dev
   const map = {
@@ -385,6 +408,7 @@ function renderMessage(msg, index) {
             <span class="msg-ts">${formatDate(msg.timestamp)}</span>
             <button class="truncate-btn" onclick="event.stopPropagation(); truncateFrom(${index})" title="Keep only up to this message">✂ Truncate after</button>
             <button class="edit-btn" onclick="event.stopPropagation(); startEdit(${index})" title="Edit message content">✏ Edit</button>
+            <button class="insert-btn" onclick="event.stopPropagation(); showInsertDialog(${index})" title="Insert message after this one">+ Insert</button>
             <button class="branch-btn" onclick="event.stopPropagation(); branchFrom(${index})" title="Create new session branching from this message">⎇ Branch</button>
           </div>
           <div class="msg-content" id="content-${index}">
@@ -575,6 +599,43 @@ async function commitEdit(index) {
     setStatus('Edit saved.');
   } catch(e) {
     setStatus('Edit failed: ' + e);
+  }
+}
+
+let insertAfterIndex = null;
+
+function showInsertDialog(index) {
+  insertAfterIndex = index;
+  document.getElementById('insert-ta').value = '';
+  document.querySelector('input[name="insert-role"][value="user"]').checked = true;
+  document.getElementById('insert-overlay').classList.add('show');
+  setTimeout(() => document.getElementById('insert-ta').focus(), 50);
+}
+
+function hideInsertDialog(e) {
+  if (e && e.target !== document.getElementById('insert-overlay')) return;
+  document.getElementById('insert-overlay').classList.remove('show');
+}
+
+async function commitInsert() {
+  const text = document.getElementById('insert-ta').value.trim();
+  if (!text) return;
+  const role = document.querySelector('input[name="insert-role"]:checked').value;
+  const msg = allMessages[insertAfterIndex];
+  hideInsertDialog();
+  setStatus('Inserting message...');
+  try {
+    await inv('insert_message', {
+      project_id: currentProject,
+      session_id: currentSession,
+      after_uuid: msg.uuid,
+      role,
+      text,
+    });
+    setStatus('Message inserted. Reloading...');
+    await loadConversation(currentSession);
+  } catch(e) {
+    setStatus('Insert failed: ' + e);
   }
 }
 
