@@ -856,16 +856,35 @@ func extractText(content json.RawMessage) string {
 	return strings.Join(texts, "\n")
 }
 
+const summarizeSystemPrompt = `You are a conversation summarizer. Output only a concise summary of the conversation provided. Do not use any tools. Do not ask questions. Output the summary text directly with no preamble.`
+
 func runClaude(prompt string) (string, error) {
-	cmd := exec.Command("claude", "-p", prompt)
+	cmd := exec.Command("claude", "-p",
+		"--output-format", "json",
+		"--system-prompt", summarizeSystemPrompt,
+		prompt,
+	)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
-			return "", fmt.Errorf("exit status 1: %s", strings.TrimSpace(string(ee.Stderr)))
+			return "", fmt.Errorf("%s", strings.TrimSpace(string(ee.Stderr)))
 		}
 		return "", err
 	}
-	return string(out), nil
+
+	// Parse JSON output: {"type":"result","result":"...","session_id":"..."}
+	var result struct {
+		Result string `json:"result"`
+		Error  string `json:"error"`
+	}
+	if err := json.Unmarshal(out, &result); err != nil {
+		// Fallback: treat raw output as text
+		return strings.TrimSpace(string(out)), nil
+	}
+	if result.Error != "" {
+		return "", fmt.Errorf("%s", result.Error)
+	}
+	return strings.TrimSpace(result.Result), nil
 }
 
 // ApplySummary replaces the selected messages with a single summary user message.
