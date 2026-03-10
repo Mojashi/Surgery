@@ -1098,7 +1098,7 @@ func runClaude(prompt, jsonSchema string) (string, error) {
 
 // runClaudeStreaming streams output tokens via Wails events and returns the final result.
 func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt string) (string, error) {
-	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--effort", "low"}
+	args := []string{"-p", "--output-format", "stream-json", "--verbose", "--effort", "low", "--model", "claude-sonnet-4-6"}
 	if jsonSchema != "" {
 		args = append(args, "--json-schema", jsonSchema)
 	}
@@ -1157,7 +1157,7 @@ func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt st
 }
 
 func runClaudeWithSystem(prompt, jsonSchema, systemPrompt string) (string, error) {
-	args := []string{"-p", "--output-format", "json", "--effort", "low"}
+	args := []string{"-p", "--output-format", "json", "--effort", "low", "--model", "claude-sonnet-4-6"}
 	if jsonSchema != "" {
 		args = append(args, "--json-schema", jsonSchema)
 	}
