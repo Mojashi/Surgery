@@ -932,6 +932,8 @@ async function applyIdealized() {
         type: im.role,
         timestamp: new Date().toISOString(),
         message: { role: im.role, content },
+        sessionId: currentSession,
+        isSidechain: false,
       });
       newLines.push(rawLine);
       newMsgObjects.push({

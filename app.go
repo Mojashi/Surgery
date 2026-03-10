@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -206,31 +205,18 @@ func (a *App) ListSessions(projectID string) ([]Session, error) {
 
 		var preview string
 		msgCount := 0
-		f, err := os.Open(path)
-		if err == nil {
-			scanner := bufio.NewScanner(f)
-			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-			for scanner.Scan() {
-				var d map[string]json.RawMessage
-				if err := json.Unmarshal(scanner.Bytes(), &d); err != nil {
-					continue
-				}
-				var t string
-				json.Unmarshal(d["type"], &t)
-				if t != "user" && t != "assistant" {
-					continue
-				}
-				msgCount++
-				if preview == "" && t == "user" {
-					var msg map[string]json.RawMessage
-					json.Unmarshal(d["message"], &msg)
-					cs := parseContentSummary(msg["content"])
-					if !strings.HasPrefix(cs.TextPreview, "<") && len(cs.TextPreview) > 5 {
-						preview = cs.TextPreview
-					}
+		entries, _ := ReadJSONLFile(path)
+		for _, e := range entries {
+			if !e.IsMessage() {
+				continue
+			}
+			msgCount++
+			if preview == "" && e.Type == "user" && e.Message != nil {
+				cs := parseContentSummary(e.Message.Content)
+				if !strings.HasPrefix(cs.TextPreview, "<") && len(cs.TextPreview) > 5 {
+					preview = cs.TextPreview
 				}
 			}
-			f.Close()
 		}
 		if preview == "" {
 			preview = "(no text)"
@@ -255,29 +241,22 @@ func (a *App) GetConversation(projectID, sessionID string) (*Conversation, error
 	if err != nil {
 		return nil, fmt.Errorf("session not found: %s", sessionID)
 	}
-	f, err := os.Open(path)
+	entries, err := ReadJSONLFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 
 	var messages []Message
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		var d map[string]json.RawMessage
-		if err := json.Unmarshal(line, &d); err != nil {
+	for _, e := range entries {
+		if !e.IsMessage() {
 			continue
 		}
-		var t string
-		json.Unmarshal(d["type"], &t)
-		if t != "user" && t != "assistant" {
-			continue
+		var cs ContentSummary
+		var model string
+		if e.Message != nil {
+			cs = parseContentSummary(e.Message.Content)
+			model = e.Message.Model
 		}
-		var msg map[string]json.RawMessage
-		json.Unmarshal(d["message"], &msg)
-		cs := parseContentSummary(msg["content"])
 
 		isToolOnly := len(cs.Types) > 0
 		for _, ct := range cs.Types {
@@ -287,28 +266,25 @@ func (a *App) GetConversation(projectID, sessionID string) (*Conversation, error
 			}
 		}
 		var contentStr string
-		json.Unmarshal(msg["content"], &contentStr)
+		if e.Message != nil {
+			json.Unmarshal(e.Message.Content, &contentStr)
+		}
 		isSystem := strings.HasPrefix(contentStr, "<")
 
-		var uuid, parentUUID, role, timestamp, model string
-		json.Unmarshal(d["uuid"], &uuid)
-		json.Unmarshal(d["parentUuid"], &parentUUID)
-		json.Unmarshal(d["timestamp"], &timestamp)
-		json.Unmarshal(msg["role"], &role)
-		json.Unmarshal(msg["model"], &model)
-		var isSidechain bool
-		json.Unmarshal(d["isSidechain"], &isSidechain)
+		role := e.Type
+		if e.Message != nil {
+			role = e.Message.Role
+		}
 
-		raw := make([]byte, len(line))
-		copy(raw, line)
+		raw, _ := e.Marshal()
 
 		messages = append(messages, Message{
-			UUID:           uuid,
-			ParentUUID:     parentUUID,
-			Type:           t,
+			UUID:           e.UUID,
+			ParentUUID:     e.GetParentUUID(),
+			Type:           e.Type,
 			Role:           role,
-			Timestamp:      timestamp,
-			IsSidechain:    isSidechain,
+			Timestamp:      e.Timestamp,
+			IsSidechain:    e.IsSidechain,
 			ContentSummary: cs,
 			IsToolOnly:     isToolOnly,
 			IsSystem:       isSystem,
@@ -321,7 +297,8 @@ func (a *App) GetConversation(projectID, sessionID string) (*Conversation, error
 
 func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*SaveResult, error) {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-	if _, err := os.Stat(path); err != nil {
+	entries, err := ReadJSONLFile(path)
+	if err != nil {
 		return nil, fmt.Errorf("session not found: %s", sessionID)
 	}
 
@@ -330,45 +307,21 @@ func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*S
 		keepSet[u] = true
 	}
 
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	var rawLines [][]byte
 	uuidToParent := map[string]string{}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := make([]byte, len(scanner.Bytes()))
-		copy(line, scanner.Bytes())
-		rawLines = append(rawLines, line)
-		var d map[string]json.RawMessage
-		if err := json.Unmarshal(line, &d); err == nil {
-			var uuid, parent string
-			json.Unmarshal(d["uuid"], &uuid)
-			json.Unmarshal(d["parentUuid"], &parent)
-			if uuid != "" {
-				uuidToParent[uuid] = parent
-			}
+	for _, e := range entries {
+		if e.UUID != "" {
+			uuidToParent[e.UUID] = e.GetParentUUID()
 		}
 	}
-	f.Close()
 
 	// Build the set of all UUIDs that will survive in the output
 	survivingUUIDs := make(map[string]bool)
 	for k := range keepSet {
 		survivingUUIDs[k] = true
 	}
-	for _, line := range rawLines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal(line, &d) != nil {
-			continue
-		}
-		var t, uuid string
-		json.Unmarshal(d["type"], &t)
-		json.Unmarshal(d["uuid"], &uuid)
-		if t != "user" && t != "assistant" && uuid != "" {
-			survivingUUIDs[uuid] = true
+	for _, e := range entries {
+		if !e.IsMessage() && e.UUID != "" {
+			survivingUUIDs[e.UUID] = true
 		}
 	}
 
@@ -390,78 +343,54 @@ func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*S
 	for _, u := range req.DeletedUUIDs {
 		deletedSet[u] = true
 	}
-	// Determine last inserted UUID (for parentUuid repair of post-gap messages)
+
+	// Parse inserted lines as entries and find last insert UUID
+	var insertEntries []*JSONLEntry
 	var lastInsertUUID string
-	if len(req.InsertLines) > 0 {
-		var d map[string]json.RawMessage
-		last := req.InsertLines[len(req.InsertLines)-1]
-		if json.Unmarshal([]byte(last), &d) == nil {
-			json.Unmarshal(d["uuid"], &lastInsertUUID)
-		}
-		// Add inserted UUIDs to surviving set
-		for _, il := range req.InsertLines {
-			var id map[string]json.RawMessage
-			if json.Unmarshal([]byte(il), &id) == nil {
-				var u string
-				json.Unmarshal(id["uuid"], &u)
-				if u != "" {
-					survivingUUIDs[u] = true
-				}
-			}
+	for _, il := range req.InsertLines {
+		ie, err := ParseEntry([]byte(il))
+		if err == nil {
+			insertEntries = append(insertEntries, ie)
+			lastInsertUUID = ie.UUID
+			survivingUUIDs[ie.UUID] = true
 		}
 	}
 
-	// Helper to fix parentUuid on a raw JSON map if needed
-	fixParentUuid := func(d map[string]json.RawMessage, line []byte) string {
-		var parent string
-		json.Unmarshal(d["parentUuid"], &parent)
+	// Helper to fix parentUuid if needed
+	fixParentUuid := func(e *JSONLEntry) {
+		parent := e.GetParentUUID()
 		if parent == "" || survivingUUIDs[parent] {
-			return string(line)
+			return
 		}
-		// If parent was explicitly deleted and we have inserts, point to last insert
 		if deletedSet[parent] && lastInsertUUID != "" {
-			d["parentUuid"], _ = json.Marshal(lastInsertUUID)
-			out, _ := json.Marshal(d)
-			return string(out)
+			e.SetParentUUID(lastInsertUUID)
+			return
 		}
 		ancestor := findSurvivingAncestor(parent)
 		if ancestor == "" {
-			d["parentUuid"] = json.RawMessage("null")
+			e.ParentUUID = nil
 		} else {
-			b, _ := json.Marshal(ancestor)
-			d["parentUuid"] = b
+			e.SetParentUUID(ancestor)
 		}
-		out, _ := json.Marshal(d)
-		return string(out)
 	}
 
-	var linesToWrite []string
+	var output []*JSONLEntry
 	insertedAtGap := false
-	for _, line := range rawLines {
-		var d map[string]json.RawMessage
-		if err := json.Unmarshal(line, &d); err != nil {
-			linesToWrite = append(linesToWrite, string(line))
+	for _, e := range entries {
+		if !e.IsMessage() {
+			fixParentUuid(e)
+			output = append(output, e)
 			continue
 		}
-		var t string
-		json.Unmarshal(d["type"], &t)
-		if t != "user" && t != "assistant" {
-			// Keep metadata records, but fix parentUuid if needed
-			linesToWrite = append(linesToWrite, fixParentUuid(d, line))
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if !keepSet[uuid] {
-			// Insert lines at the first gap
-			if !insertedAtGap && len(req.InsertLines) > 0 {
-				linesToWrite = append(linesToWrite, req.InsertLines...)
+		if !keepSet[e.UUID] {
+			if !insertedAtGap && len(insertEntries) > 0 {
+				output = append(output, insertEntries...)
 				insertedAtGap = true
 			}
 			continue
 		}
-		// Fix parentUuid if parent was deleted
-		linesToWrite = append(linesToWrite, fixParentUuid(d, line))
+		fixParentUuid(e)
+		output = append(output, e)
 	}
 
 	backup := path + ".bak"
@@ -471,19 +400,14 @@ func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*S
 	src.Close()
 	dst.Close()
 
-	out, err := os.Create(path)
-	if err != nil {
+	if err := WriteJSONLFile(path, output); err != nil {
 		return nil, err
 	}
-	for _, line := range linesToWrite {
-		fmt.Fprintln(out, line)
-	}
-	out.Close()
 
 	newInfo, _ := os.Stat(path)
 	return &SaveResult{
 		Success:   true,
-		KeptLines: len(linesToWrite),
+		KeptLines: len(output),
 		NewSize:   newInfo.Size(),
 		Backup:    backup,
 	}, nil
@@ -492,59 +416,39 @@ func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*S
 // EditMessage updates the text content of a specific message.
 func (a *App) EditMessage(projectID, sessionID, uuid, newText string) error {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-
-	f, err := os.Open(path)
+	entries, err := ReadJSONLFile(path)
 	if err != nil {
 		return err
 	}
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	f.Close()
 
-	var updated []string
-	for _, line := range lines {
-		var d map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(line), &d); err != nil {
-			updated = append(updated, line)
+	for _, e := range entries {
+		if e.UUID != uuid {
 			continue
 		}
-		var u string
-		json.Unmarshal(d["uuid"], &u)
-		if u != uuid {
-			updated = append(updated, line)
+		if e.Message == nil {
 			continue
 		}
 
 		// Update content: replace text block(s) with newText
-		var msg map[string]json.RawMessage
-		json.Unmarshal(d["message"], &msg)
-		content := msg["content"]
-
+		content := e.Message.Content
 		var s string
 		if json.Unmarshal(content, &s) == nil {
 			// String content: replace directly
-			b, _ := json.Marshal(newText)
-			msg["content"] = b
+			e.Message.Content, _ = json.Marshal(newText)
 		} else {
 			var arr []json.RawMessage
 			if json.Unmarshal(content, &arr) == nil {
-				// Array: update all text blocks
 				first := true
 				for i, item := range arr {
 					var block map[string]json.RawMessage
-					if err := json.Unmarshal(item, &block); err != nil {
+					if json.Unmarshal(item, &block) != nil {
 						continue
 					}
 					var t string
 					json.Unmarshal(block["type"], &t)
 					if t == "text" {
 						if first {
-							b, _ := json.Marshal(newText)
-							block["text"] = b
+							block["text"], _ = json.Marshal(newText)
 							first = false
 						} else {
 							block["text"] = json.RawMessage(`""`)
@@ -552,57 +456,28 @@ func (a *App) EditMessage(projectID, sessionID, uuid, newText string) error {
 						arr[i], _ = json.Marshal(block)
 					}
 				}
-				b, _ := json.Marshal(arr)
-				msg["content"] = b
+				e.Message.Content, _ = json.Marshal(arr)
 			}
 		}
-
-		msgBytes, _ := json.Marshal(msg)
-		d["message"] = msgBytes
-		out, _ := json.Marshal(d)
-		updated = append(updated, string(out))
+		break
 	}
 
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	for _, line := range updated {
-		fmt.Fprintln(out, line)
-	}
-	out.Close()
-	return nil
+	return WriteJSONLFile(path, entries)
 }
 
 // setSidechainFrom sets isSidechain on all descendants of fromUUID (exclusive).
-// If toMain=true, restores them to main (isSidechain=false).
+// If toSidechain=true, marks them as sidechain; false restores to main.
 func (a *App) setSidechainFrom(projectID, sessionID, fromUUID string, toSidechain bool) error {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-
-	f, err := os.Open(path)
+	entries, err := ReadJSONLFile(path)
 	if err != nil {
 		return err
 	}
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	f.Close()
 
-	// Build uuid->parentUuid map and collect all descendants of fromUUID
 	uuidToParent := map[string]string{}
-	for _, line := range lines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			continue
-		}
-		var uuid, parent string
-		json.Unmarshal(d["uuid"], &uuid)
-		json.Unmarshal(d["parentUuid"], &parent)
-		if uuid != "" {
-			uuidToParent[uuid] = parent
+	for _, e := range entries {
+		if e.UUID != "" {
+			uuidToParent[e.UUID] = e.GetParentUUID()
 		}
 	}
 
@@ -619,37 +494,13 @@ func (a *App) setSidechainFrom(projectID, sessionID, fromUUID string, toSidechai
 		}
 	}
 
-	var updated []string
-	for _, line := range lines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			updated = append(updated, line)
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if uuid != "" && isDescendant[uuid] {
-			if toSidechain {
-				d["isSidechain"] = json.RawMessage("true")
-			} else {
-				d["isSidechain"] = json.RawMessage("false")
-			}
-			out, _ := json.Marshal(d)
-			updated = append(updated, string(out))
-		} else {
-			updated = append(updated, line)
+	for _, e := range entries {
+		if e.UUID != "" && isDescendant[e.UUID] {
+			e.IsSidechain = toSidechain
 		}
 	}
 
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	for _, line := range updated {
-		fmt.Fprintln(out, line)
-	}
-	out.Close()
-	return nil
+	return WriteJSONLFile(path, entries)
 }
 
 func projectIDToPath(id string) string {
@@ -763,86 +614,36 @@ func (a *App) ExecClaude(projectID string, sessionID string, skipPermissions boo
 // The message after afterUUID gets its parentUuid updated to the new message.
 func (a *App) InsertMessage(projectID, sessionID, afterUUID, role, text string) error {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-	f, err := os.Open(path)
+	entries, err := ReadJSONLFile(path)
 	if err != nil {
 		return err
 	}
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	f.Close()
 
-	// Generate new UUID
-	b := make([]byte, 16)
-	rand.Read(b)
-	newUUID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	newUUID := generateUUID()
+	newEntry := NewEntry(newUUID, afterUUID, role, sessionID, NewMessageContent(role, text))
 
-	// Build new message line
-	msgContent, _ := json.Marshal(text)
-	newMsg := map[string]interface{}{
-		"role":    role,
-		"content": json.RawMessage(msgContent),
-	}
-	msgBytes, _ := json.Marshal(newMsg)
-	newLine := map[string]interface{}{
-		"uuid":       newUUID,
-		"parentUuid": afterUUID,
-		"type":       role,
-		"timestamp":  "2006-01-02T15:04:05.000Z",
-		"message":    json.RawMessage(msgBytes),
-	}
-	newLineBytes, _ := json.Marshal(newLine)
-
-	// Insert after afterUUID, update next message's parentUuid
-	var out []string
-	for _, line := range lines {
-		out = append(out, line)
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if uuid == afterUUID {
-			out = append(out, string(newLineBytes))
+	// Insert after afterUUID
+	var out []*JSONLEntry
+	for _, e := range entries {
+		out = append(out, e)
+		if e.UUID == afterUUID {
+			out = append(out, newEntry)
 		}
 	}
 
-	// Update any message whose parentUuid == afterUUID (except our new one) to point to newUUID
-	// Only update the first one found (the direct child in the main chain)
+	// Update first child whose parentUuid == afterUUID to point to newUUID
 	updatedChild := false
-	for i, line := range out {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
+	for _, e := range out {
+		if e.UUID == newUUID {
 			continue
 		}
-		var uuid, parent string
-		json.Unmarshal(d["uuid"], &uuid)
-		json.Unmarshal(d["parentUuid"], &parent)
-		if uuid == newUUID {
-			continue // skip our inserted message
-		}
-		if parent == afterUUID && !updatedChild {
-			d["parentUuid"], _ = json.Marshal(newUUID)
-			fixed, _ := json.Marshal(d)
-			out[i] = string(fixed)
+		if e.GetParentUUID() == afterUUID && !updatedChild {
+			e.SetParentUUID(newUUID)
 			updatedChild = true
 		}
 	}
 
-	outFile, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	for _, line := range out {
-		fmt.Fprintln(outFile, line)
-	}
-	outFile.Close()
-	return nil
+	return WriteJSONLFile(path, out)
 }
 
 func (a *App) BranchFrom(projectID, sessionID, fromUUID string) error {
@@ -856,99 +657,67 @@ func (a *App) RestoreSidechain(projectID, sessionID, fromUUID string) error {
 // BranchNewSession copies all lines up to and including fromUUID into a new session file.
 // Returns the new session ID.
 func (a *App) BranchNewSession(projectID, sessionID, fromUUID string) (string, error) {
-	src := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-
-	f, err := os.Open(src)
+	srcPath := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	entries, err := ReadJSONLFile(srcPath)
 	if err != nil {
 		return "", err
 	}
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		lines = append(lines, line)
-		// stop after the target message
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) == nil {
-			var uuid string
-			json.Unmarshal(d["uuid"], &uuid)
-			if uuid == fromUUID {
-				break
-			}
+
+	// Keep entries up to and including fromUUID
+	var kept []*JSONLEntry
+	for _, e := range entries {
+		kept = append(kept, e)
+		if e.UUID == fromUUID {
+			break
 		}
 	}
-	f.Close()
 
-	// generate new session ID (UUID v4-ish)
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	newID := generateUUID()
+	dstPath := filepath.Join(claudeDir(), projectID, newID+".jsonl")
+	if err := WriteJSONLFile(dstPath, kept); err != nil {
 		return "", err
 	}
-	newID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-
-	dst := filepath.Join(claudeDir(), projectID, newID+".jsonl")
-	out, err := os.Create(dst)
-	if err != nil {
-		return "", err
-	}
-	for _, line := range lines {
-		fmt.Fprintln(out, line)
-	}
-	out.Close()
-
 	return newID, nil
 }
 
 // extractSelectedMessages returns raw message objects (role+content) for selected UUIDs, in file order.
-func extractSelectedMessages(path string, uuidSet map[string]bool) ([]map[string]json.RawMessage, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var msgs []map[string]json.RawMessage
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		var d map[string]json.RawMessage
-		if json.Unmarshal(scanner.Bytes(), &d) != nil {
-			continue
+// selectEntries returns entries matching the given UUID set, in file order.
+func selectEntries(entries []*JSONLEntry, uuidSet map[string]bool) []*JSONLEntry {
+	var result []*JSONLEntry
+	for _, e := range entries {
+		if uuidSet[e.UUID] {
+			result = append(result, e)
 		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if !uuidSet[uuid] {
-			continue
-		}
-		var msg map[string]json.RawMessage
-		json.Unmarshal(d["message"], &msg)
-		msgs = append(msgs, msg)
 	}
-	return msgs, nil
+	return result
 }
 
 // SummarizeMessages calls `claude -p` to summarize the selected messages.
 func (a *App) SummarizeMessages(projectID, sessionID string, uuids []string) (string, error) {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	entries, err := ReadJSONLFile(path)
+	if err != nil {
+		return "", err
+	}
 	uuidSet := make(map[string]bool, len(uuids))
 	for _, u := range uuids {
 		uuidSet[u] = true
 	}
-	msgs, err := extractSelectedMessages(path, uuidSet)
-	if err != nil {
-		return "", err
-	}
-	if len(msgs) == 0 {
+	selected := selectEntries(entries, uuidSet)
+	if len(selected) == 0 {
 		return "", fmt.Errorf("no selected messages found")
 	}
 
 	var parts []string
-	for _, msg := range msgs {
-		var role string
-		json.Unmarshal(msg["role"], &role)
-		text := extractText(msg["content"])
+	for _, e := range selected {
+		role := e.Type
+		if e.Message != nil {
+			role = e.Message.Role
+		}
+		text := ""
+		if e.Message != nil {
+			text = extractText(e.Message.Content)
+		}
 		if text == "" {
 			text = "[no text]"
 		}
@@ -992,17 +761,14 @@ func buildIdealizeSchema(uuids []string) string {
 // - {"mode":"rewrite","messages":[{role,content}]} for full rewrite
 func (a *App) IdealizeMessages(projectID, sessionID string, uuids []string) (string, error) {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	entries, err := ReadJSONLFile(path)
+	if err != nil {
+		return "", err
+	}
 	uuidSet := make(map[string]bool, len(uuids))
 	for _, u := range uuids {
 		uuidSet[u] = true
 	}
-
-	// Read messages with UUIDs attached
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
 
 	type msgWithUUID struct {
 		UUID    string          `json:"uuid"`
@@ -1010,23 +776,14 @@ func (a *App) IdealizeMessages(projectID, sessionID string, uuids []string) (str
 		Content json.RawMessage `json:"content"`
 	}
 	var labeled []msgWithUUID
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		var d map[string]json.RawMessage
-		if json.Unmarshal(scanner.Bytes(), &d) != nil {
-			continue
+	for _, e := range selectEntries(entries, uuidSet) {
+		role := e.Type
+		var content json.RawMessage
+		if e.Message != nil {
+			role = e.Message.Role
+			content = e.Message.Content
 		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if !uuidSet[uuid] {
-			continue
-		}
-		var msg map[string]json.RawMessage
-		json.Unmarshal(d["message"], &msg)
-		var role string
-		json.Unmarshal(msg["role"], &role)
-		labeled = append(labeled, msgWithUUID{UUID: uuid, Role: role, Content: msg["content"]})
+		labeled = append(labeled, msgWithUUID{UUID: e.UUID, Role: role, Content: content})
 	}
 
 	if len(labeled) == 0 {
@@ -1048,27 +805,19 @@ func (a *App) IdealizeMessages(projectID, sessionID string, uuids []string) (str
 // ApplyIdealized creates a new session replacing the selected range with idealized messages.
 // Returns the new session ID.
 func (a *App) ApplyIdealized(projectID, sessionID string, uuids []string, messagesJSON string) (string, error) {
-	// Parse idealized messages
 	var idealMsgs []struct {
-		Role    string            `json:"role"`
-		Content json.RawMessage   `json:"content"`
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
 	}
 	if err := json.Unmarshal([]byte(messagesJSON), &idealMsgs); err != nil {
 		return "", fmt.Errorf("invalid messages JSON: %w", err)
 	}
 
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-	f, err := os.Open(path)
+	entries, err := ReadJSONLFile(path)
 	if err != nil {
 		return "", err
 	}
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	f.Close()
 
 	uuidSet := make(map[string]bool, len(uuids))
 	for _, u := range uuids {
@@ -1077,104 +826,53 @@ func (a *App) ApplyIdealized(projectID, sessionID string, uuids []string, messag
 
 	// Find parentUuid of first selected message
 	var firstParentUUID string
-	for _, line := range lines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if uuidSet[uuid] {
-			json.Unmarshal(d["parentUuid"], &firstParentUUID)
+	for _, e := range entries {
+		if uuidSet[e.UUID] {
+			firstParentUUID = e.GetParentUUID()
 			break
 		}
 	}
 
-	// Generate UUIDs for idealized messages and build JSONL lines
-	type idealLine struct {
-		uuid string
-		line string
-	}
-	var idealLines []idealLine
+	// Build new entries for idealized messages
+	var newEntries []*JSONLEntry
 	prevUUID := firstParentUUID
 	for _, im := range idealMsgs {
-		b := make([]byte, 16)
-		rand.Read(b)
-		newUUID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-
-		msgBytes, _ := json.Marshal(map[string]interface{}{
-			"role":    im.Role,
-			"content": im.Content,
-		})
-		d := map[string]interface{}{
-			"uuid":       newUUID,
-			"parentUuid": prevUUID,
-			"type":       im.Role,
-			"timestamp":  "2006-01-02T15:04:05.000Z",
-			"message":    json.RawMessage(msgBytes),
-		}
-		lineBytes, _ := json.Marshal(d)
-		idealLines = append(idealLines, idealLine{uuid: newUUID, line: string(lineBytes)})
-		prevUUID = newUUID
+		e := NewEntry(generateUUID(), prevUUID, im.Role, sessionID,
+			NewMessageContentBlocks(im.Role, im.Content))
+		newEntries = append(newEntries, e)
+		prevUUID = e.UUID
 	}
-
 	lastIdealUUID := prevUUID
 
-	// Build new session: pre-selection + idealized + post-selection
-	var outLines []string
+	// Build output: pre-selection + idealized + post-selection
+	var output []*JSONLEntry
 	inSelection := false
 	passedSelection := false
 	firstPostFixed := false
-	for _, line := range lines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			outLines = append(outLines, line)
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-
-		if uuidSet[uuid] {
+	for _, e := range entries {
+		if uuidSet[e.UUID] {
 			if !inSelection {
 				inSelection = true
-				// Insert idealized messages here
-				for _, il := range idealLines {
-					outLines = append(outLines, il.line)
-				}
+				output = append(output, newEntries...)
 			}
 			passedSelection = true
-			continue // skip original selected messages
+			continue
 		}
-
 		if passedSelection && !firstPostFixed {
-			// Fix parentUuid of first post-selection message
-			var parent string
-			json.Unmarshal(d["parentUuid"], &parent)
-			if uuidSet[parent] {
-				d["parentUuid"], _ = json.Marshal(lastIdealUUID)
-				fixed, _ := json.Marshal(d)
-				outLines = append(outLines, string(fixed))
+			if uuidSet[e.GetParentUUID()] {
+				e.SetParentUUID(lastIdealUUID)
 				firstPostFixed = true
-				continue
 			}
 		}
-		outLines = append(outLines, line)
+		output = append(output, e)
 	}
 	_ = inSelection
 
-	// Write new session
-	b := make([]byte, 16)
-	rand.Read(b)
-	newID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-	dst := filepath.Join(claudeDir(), projectID, newID+".jsonl")
-	out, err := os.Create(dst)
-	if err != nil {
+	newID := generateUUID()
+	dstPath := filepath.Join(claudeDir(), projectID, newID+".jsonl")
+	if err := WriteJSONLFile(dstPath, output); err != nil {
 		return "", err
 	}
-	for _, line := range outLines {
-		fmt.Fprintln(out, line)
-	}
-	out.Close()
 	return newID, nil
 }
 
@@ -1383,7 +1081,7 @@ func runClaudeWithSystem(prompt, jsonSchema, systemPrompt string) (string, error
 // ApplySummary replaces the selected messages with a single summary user message.
 func (a *App) ApplySummary(projectID, sessionID string, uuids []string, summary string) error {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
-	f, err := os.Open(path)
+	entries, err := ReadJSONLFile(path)
 	if err != nil {
 		return err
 	}
@@ -1393,89 +1091,40 @@ func (a *App) ApplySummary(projectID, sessionID string, uuids []string, summary 
 		uuidSet[u] = true
 	}
 
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	f.Close()
-
-	// Find where the first selected message appears and its parentUuid
-	firstIdx := -1
+	// Find parentUuid of first selected message
 	var firstParentUUID string
-	for i, line := range lines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if uuidSet[uuid] {
-			firstIdx = i
-			json.Unmarshal(d["parentUuid"], &firstParentUUID)
+	found := false
+	for _, e := range entries {
+		if uuidSet[e.UUID] {
+			firstParentUUID = e.GetParentUUID()
+			found = true
 			break
 		}
 	}
-	if firstIdx < 0 {
+	if !found {
 		return fmt.Errorf("selected messages not found")
 	}
 
-	// Generate UUID for summary message
-	b := make([]byte, 16)
-	rand.Read(b)
-	summaryUUID := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	summaryEntry := NewEntry(generateUUID(), firstParentUUID, "user", sessionID,
+		NewMessageContent("user", "[Summary]\n"+summary))
+	summaryEntry.IsSummary = true
 
-	// Build summary message line
-	summaryMsg := map[string]interface{}{
-		"role":    "user",
-		"content": "[Summary]\n" + summary,
-	}
-	summaryMsgBytes, _ := json.Marshal(summaryMsg)
-	summaryLine := map[string]interface{}{
-		"uuid":       summaryUUID,
-		"parentUuid": firstParentUUID,
-		"type":       "user",
-		"timestamp":  "2006-01-02T15:04:05.000Z",
-		"message":    json.RawMessage(summaryMsgBytes),
-		"isSummary":  true,
-	}
-	summaryLineBytes, _ := json.Marshal(summaryLine)
-
-	// Write output: replace selected block with summary message,
-	// update any message whose parentUuid is in uuidSet to point to summaryUUID
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
+	// Build output: replace selected block with summary, fix parentUuid references
+	var output []*JSONLEntry
 	inserted := false
-	for _, line := range lines {
-		var d map[string]json.RawMessage
-		if json.Unmarshal([]byte(line), &d) != nil {
-			fmt.Fprintln(out, line)
-			continue
-		}
-		var uuid string
-		json.Unmarshal(d["uuid"], &uuid)
-		if uuidSet[uuid] {
+	for _, e := range entries {
+		if uuidSet[e.UUID] {
 			if !inserted {
-				fmt.Fprintln(out, string(summaryLineBytes))
+				output = append(output, summaryEntry)
 				inserted = true
 			}
-			continue // skip selected messages
+			continue
 		}
-		// Fix parentUuid if it pointed to a deleted message
-		var parent string
-		json.Unmarshal(d["parentUuid"], &parent)
-		if uuidSet[parent] {
-			d["parentUuid"], _ = json.Marshal(summaryUUID)
-			fixed, _ := json.Marshal(d)
-			fmt.Fprintln(out, string(fixed))
-		} else {
-			fmt.Fprintln(out, line)
+		if uuidSet[e.GetParentUUID()] {
+			e.SetParentUUID(summaryEntry.UUID)
 		}
+		output = append(output, e)
 	}
-	out.Close()
-	return nil
+
+	return WriteJSONLFile(path, output)
 }
