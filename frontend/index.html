@@ -958,12 +958,21 @@ function computeWasteScore(msg) {
 
   let score = 0; // 0=efficient, 1=max waste
   let label = '';
+  const progressTools = ['Write', 'Edit', 'NotebookEdit', 'write', 'edit'];
+  const readTools = ['Read', 'Glob', 'Grep', 'Bash', 'read', 'glob', 'grep', 'bash'];
 
-  // Check for errors in tool_result
   if (Array.isArray(raw)) {
+    let hasError = false, hasProgress = false, hasRead = false;
     for (const b of raw) {
-      if (b.type === 'tool_result' && b.is_error) { score = 1.0; label = 'error'; break; }
+      if (b.type === 'tool_result' && b.is_error) hasError = true;
+      if (b.type === 'tool_use') {
+        if (progressTools.some(t => (b.name || '').includes(t))) hasProgress = true;
+        else if (readTools.some(t => (b.name || '').includes(t))) hasRead = true;
+      }
     }
+    if (hasError) { score = 1.0; label = 'error'; }
+    else if (hasProgress) { score = 0.0; label = 'write'; }
+    else if (hasRead) { score = 0.3; label = 'read'; }
   }
 
   if (!label) {
@@ -980,18 +989,18 @@ function computeWasteScore(msg) {
     }
   }
 
-  // Size factor: larger = more waste potential
   const size = cs?.size || 0;
-  if (size > 5000) score = Math.min(1, score + 0.2);
+  if (size > 5000 && label !== 'write') score = Math.min(1, score + 0.2);
 
   return { score, label, size };
 }
 
-function wasteColor(score) {
-  if (score >= 0.8) return '#f85149';
-  if (score >= 0.5) return '#d29922';
-  if (score >= 0.3) return '#3fb950';
-  return '#238636';
+function wasteColor(score, label) {
+  if (score >= 0.8) return '#f85149';  // error
+  if (score >= 0.5) return '#d29922';  // trial-and-error
+  if (label === 'write') return '#1f6feb'; // progress (blue)
+  if (score >= 0.3) return '#3fb950';  // read/thinking
+  return '#238636';                     // text
 }
 
 function renderHeatmap() {
@@ -1001,7 +1010,7 @@ function renderHeatmap() {
 
   container.innerHTML = allMessages.map((msg, i) => {
     const w = computeWasteScore(msg);
-    const color = wasteColor(w.score);
+    const color = wasteColor(w.score, w.label);
     const deleted = deletedUuids.has(msg.uuid);
     const opacity = deleted ? 0.2 : 1;
     return `<div class="conv-heatmap-cell" style="background:${color};opacity:${opacity}" onclick="scrollToMsg(${i})"><span class="tooltip">#${i+1} ${msg.role} · ${w.label} · ${formatSize(w.size)}</span></div>`;
