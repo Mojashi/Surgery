@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type App struct {
@@ -91,7 +93,9 @@ type Conversation struct {
 }
 
 type SaveRequest struct {
-	KeepUUIDs []string `json:"keep_uuids"`
+	KeepUUIDs    []string `json:"keep_uuids"`
+	DeletedUUIDs []string `json:"deleted_uuids"` // for parentUuid repair after insertion
+	InsertLines  []string `json:"insert_lines"`  // pre-built JSONL lines to insert at deletion gap
 }
 
 type SaveResult struct {
@@ -364,7 +368,23 @@ func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*S
 		return ""
 	}
 
+	// Build deleted set for insert-gap detection
+	deletedSet := make(map[string]bool)
+	for _, u := range req.DeletedUUIDs {
+		deletedSet[u] = true
+	}
+	// Determine last inserted UUID (for parentUuid repair of post-gap messages)
+	var lastInsertUUID string
+	if len(req.InsertLines) > 0 {
+		var d map[string]json.RawMessage
+		last := req.InsertLines[len(req.InsertLines)-1]
+		if json.Unmarshal([]byte(last), &d) == nil {
+			json.Unmarshal(d["uuid"], &lastInsertUUID)
+		}
+	}
+
 	var linesToWrite []string
+	insertedAtGap := false
 	for _, line := range rawLines {
 		var d map[string]json.RawMessage
 		if err := json.Unmarshal(line, &d); err != nil {
@@ -380,11 +400,21 @@ func (a *App) SaveConversation(projectID, sessionID string, req SaveRequest) (*S
 		var uuid string
 		json.Unmarshal(d["uuid"], &uuid)
 		if !keepSet[uuid] {
+			// Insert lines at the first gap
+			if !insertedAtGap && len(req.InsertLines) > 0 {
+				linesToWrite = append(linesToWrite, req.InsertLines...)
+				insertedAtGap = true
+			}
 			continue
 		}
 		var parent string
 		json.Unmarshal(d["parentUuid"], &parent)
-		if parent != "" && !keepSet[parent] {
+		// Fix parentUuid: if parent was deleted and we inserted, point to last insert
+		if parent != "" && deletedSet[parent] && lastInsertUUID != "" {
+			d["parentUuid"], _ = json.Marshal(lastInsertUUID)
+			out, _ := json.Marshal(d)
+			linesToWrite = append(linesToWrite, string(out))
+		} else if parent != "" && !keepSet[parent] && !deletedSet[parent] {
 			ancestor := findKeptAncestor(parent)
 			if ancestor == "" {
 				d["parentUuid"] = json.RawMessage("null")
@@ -840,21 +870,34 @@ func (a *App) IdealizeMessages(projectID, sessionID string, uuids []string) (str
 
 	// Serialize messages as JSON for the prompt
 	msgsJSON, _ := json.MarshalIndent(msgs, "", "  ")
-	prompt := "以下の会話を理想の形に書き直してください:\n\n" + string(msgsJSON)
+	prompt := "Rewrite the following conversation in its ideal form and output it as structured JSON matching the schema:\n\n" + string(msgsJSON)
 
-	out, err := runClaude(prompt, idealizeSchema)
+	out, err := runClaudeStreaming(a.ctx, prompt, idealizeSchema, idealizeSystemPrompt)
 	if err != nil {
 		return "", fmt.Errorf("claude failed: %w", err)
 	}
 
-	// Extract the messages array from the response object
-	var wrapper struct {
-		Messages json.RawMessage `json:"messages"`
+	// out may be the JSON object directly, or a JSON-encoded string containing it
+	extract := func(s string) (string, error) {
+		var wrapper struct {
+			Messages json.RawMessage `json:"messages"`
+		}
+		if err := json.Unmarshal([]byte(s), &wrapper); err != nil {
+			return "", fmt.Errorf("parse failed: %w\nraw: %s", err, s)
+		}
+		return string(wrapper.Messages), nil
 	}
-	if err := json.Unmarshal([]byte(out), &wrapper); err != nil {
-		return "", fmt.Errorf("parse failed: %w\nraw: %s", err, out)
+
+	if result, err := extract(out); err == nil {
+		return result, nil
 	}
-	return string(wrapper.Messages), nil
+	var inner string
+	if json.Unmarshal([]byte(out), &inner) == nil {
+		if result, err := extract(inner); err == nil {
+			return result, nil
+		}
+	}
+	return "", fmt.Errorf("parse failed\nraw: %s", out)
 }
 
 // ApplyIdealized creates a new session replacing the selected range with idealized messages.
@@ -1048,15 +1091,81 @@ func extractText(content json.RawMessage) string {
 const summarizeSystemPrompt = `You are a conversation summarizer. Output only a concise summary of the conversation provided. Do not use any tools. Do not ask questions. Output the summary text directly with no preamble.`
 
 // runClaude calls claude -p with --output-format json.
-// If jsonSchema is non-empty, --json-schema is passed and result is parsed as JSON.
+// If jsonSchema is non-empty, --json-schema is passed; systemPrompt overrides the default.
 func runClaude(prompt, jsonSchema string) (string, error) {
+	return runClaudeWithSystem(prompt, jsonSchema, "")
+}
+
+// runClaudeStreaming streams output tokens via Wails events and returns the final result.
+func runClaudeStreaming(ctx context.Context, prompt, jsonSchema, systemPrompt string) (string, error) {
+	args := []string{"-p", "--output-format", "stream-json", "--effort", "low"}
+	if jsonSchema != "" {
+		args = append(args, "--json-schema", jsonSchema)
+	}
+	sp := systemPrompt
+	if sp == "" {
+		sp = summarizeSystemPrompt
+	}
+	args = append(args, "--system-prompt", sp, prompt)
+
+	cmd := exec.Command("claude", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", err
+	}
+	var stderrBuf strings.Builder
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Start(); err != nil {
+		return "", err
+	}
+
+	var finalResult string
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+		var event map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &event) != nil {
+			continue
+		}
+		var evType string
+		json.Unmarshal(event["type"], &evType)
+
+		switch evType {
+		case "assistant":
+			// streaming content delta — emit token to frontend
+			if ctx != nil {
+				runtime.EventsEmit(ctx, "claude:stream", line)
+			}
+		case "result":
+			var result string
+			json.Unmarshal(event["result"], &result)
+			finalResult = result
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
+		if se := strings.TrimSpace(stderrBuf.String()); se != "" {
+			return "", fmt.Errorf("%s", se)
+		}
+		return "", err
+	}
+	return strings.TrimSpace(finalResult), nil
+}
+
+func runClaudeWithSystem(prompt, jsonSchema, systemPrompt string) (string, error) {
 	args := []string{"-p", "--output-format", "json", "--effort", "low"}
 	if jsonSchema != "" {
 		args = append(args, "--json-schema", jsonSchema)
-	} else {
-		args = append(args, "--system-prompt", summarizeSystemPrompt)
 	}
-	args = append(args, prompt)
+	sp := systemPrompt
+	if sp == "" {
+		sp = summarizeSystemPrompt
+	}
+	args = append(args, "--system-prompt", sp, prompt)
 
 	cmd := exec.Command("claude", args...)
 	out, err := cmd.Output()
@@ -1067,18 +1176,18 @@ func runClaude(prompt, jsonSchema string) (string, error) {
 		return "", err
 	}
 
-	// Parse JSON output: {"type":"result","result":"...","session_id":"..."}
-	var result struct {
+	// Parse JSON envelope: {"type":"result","result":"..."}
+	var envelope struct {
 		Result string `json:"result"`
 		Error  string `json:"error"`
 	}
-	if err := json.Unmarshal(out, &result); err != nil {
+	if err := json.Unmarshal(out, &envelope); err != nil {
 		return strings.TrimSpace(string(out)), nil
 	}
-	if result.Error != "" {
-		return "", fmt.Errorf("%s", result.Error)
+	if envelope.Error != "" {
+		return "", fmt.Errorf("%s", envelope.Error)
 	}
-	return strings.TrimSpace(result.Result), nil
+	return strings.TrimSpace(envelope.Result), nil
 }
 
 // ApplySummary replaces the selected messages with a single summary user message.

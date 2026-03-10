@@ -280,6 +280,8 @@ let currentProject = null;
 let currentSession = null;
 let allMessages = [];   // parsed messages from API
 let deletedUuids = new Set();  // UUIDs marked for deletion
+let pendingInsertLines = [];   // pre-built JSONL lines to insert at deletion gap
+let pendingDeletedUuids = [];  // deleted UUIDs for parentUuid repair
 let showTools = true;
 let showSidechain = false;
 let lastCheckedIndex = null;
@@ -361,6 +363,8 @@ async function selectSession(sessionId, el) {
 function clearConversation() {
   allMessages = [];
   deletedUuids = new Set();
+  pendingInsertLines = [];
+  pendingDeletedUuids = [];
   document.getElementById('conv-messages').innerHTML = '<div class="empty-state"><div class="icon">💬</div>Select a session</div>';
   document.getElementById('conv-toolbar').style.display = 'none';
   document.getElementById('session-list').innerHTML = '<div class="empty-state"><div class="icon">📂</div>Select a project</div>';
@@ -690,18 +694,38 @@ async function startIdealize() {
   document.getElementById('idealize-apply-btn').disabled = true;
   document.getElementById('idealize-overlay').classList.add('show');
   setStatus('Idealizing with Claude...');
+
+  // Stream tokens into textarea as they arrive
+  if (window.runtime) {
+    window.runtime.EventsOn('claude:stream', (line) => {
+      try {
+        const ev = JSON.parse(line);
+        const msg = ev?.message?.content;
+        if (Array.isArray(msg)) {
+          msg.forEach(b => {
+            if (b.type === 'text' && b.text) {
+              document.getElementById('idealize-ta').value += b.text;
+            }
+          });
+        }
+      } catch(_) {}
+    });
+  }
+
   try {
     const json = await inv('idealize_messages', {
       project_id: currentProject,
       session_id: currentSession,
       uuids: pendingIdealizeUuids,
     });
+    if (window.runtime) window.runtime.EventsOff('claude:stream');
     document.getElementById('idealize-ta').value = JSON.stringify(JSON.parse(json), null, 2);
     document.getElementById('idealize-desc').textContent =
-      `Generated idealized conversation. Edit if needed, then apply as a new session.`;
+      `Generated. Edit JSON if needed, then apply.`;
     document.getElementById('idealize-apply-btn').disabled = false;
     setStatus('Idealization ready.');
   } catch(e) {
+    if (window.runtime) window.runtime.EventsOff('claude:stream');
     document.getElementById('idealize-desc').textContent = 'Error: ' + e;
     setStatus('Idealize failed: ' + e);
   }
@@ -712,28 +736,68 @@ function hideIdealizeDialog(e) {
   document.getElementById('idealize-overlay').classList.remove('show');
 }
 
+function generateUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+  });
+}
+
 async function applyIdealized() {
-  const json = document.getElementById('idealize-ta').value.trim();
-  if (!json) return;
-  // Validate JSON
-  try { JSON.parse(json); } catch(e) { setStatus('Invalid JSON: ' + e); return; }
+  const jsonStr = document.getElementById('idealize-ta').value.trim();
+  if (!jsonStr) return;
+  let idealMsgs;
+  try { idealMsgs = JSON.parse(jsonStr); } catch(e) { setStatus('Invalid JSON: ' + e); return; }
   hideIdealizeDialog();
-  setStatus('Creating new session...');
-  try {
-    const newSessionId = await inv('apply_idealized', {
-      project_id: currentProject,
-      session_id: currentSession,
-      uuids: pendingIdealizeUuids,
-      messages_json: json,
+
+  // Find first selected message's parentUuid
+  const firstSelIdx = allMessages.findIndex(m => pendingIdealizeUuids.includes(m.uuid));
+  const firstParentUuid = firstSelIdx > 0 ? allMessages[firstSelIdx - 1]?.uuid : null;
+
+  // Build JSONL lines and fake allMessages entries for the idealized messages
+  const newLines = [];
+  const newMsgObjects = [];
+  let prevUuid = firstParentUuid;
+  for (const im of idealMsgs) {
+    const uuid = generateUUID();
+    const rawLine = JSON.stringify({
+      uuid,
+      parentUuid: prevUuid,
+      type: im.role,
+      timestamp: new Date().toISOString(),
+      message: { role: im.role, content: im.content },
     });
-    deletedUuids = new Set();
-    setStatus('New session created. Reloading...');
-    await loadSessions(currentProject);
-    const el = document.querySelector(`#session-list [data-id="${newSessionId}"]`);
-    if (el) { el.classList.add('active'); await selectSession(newSessionId, el); }
-  } catch(e) {
-    setStatus('Apply failed: ' + e);
+    newLines.push(rawLine);
+    newMsgObjects.push({
+      uuid,
+      parentUuid: prevUuid,
+      role: im.role,
+      type: im.role,
+      timestamp: new Date().toISOString(),
+      isSidechain: false,
+      is_tool_only: false,
+      content_summary: { types: ['text'], text_preview: '', size: JSON.stringify(im.content).length },
+      raw: JSON.parse(rawLine),
+    });
+    prevUuid = uuid;
   }
+
+  // Store for Save
+  pendingInsertLines = newLines;
+  pendingDeletedUuids = [...pendingIdealizeUuids];
+
+  // Update allMessages in place: remove selected, insert new at that position
+  const selSet = new Set(pendingIdealizeUuids);
+  const firstIdx = allMessages.findIndex(m => selSet.has(m.uuid));
+  allMessages = allMessages.filter(m => !selSet.has(m.uuid));
+  allMessages.splice(firstIdx, 0, ...newMsgObjects);
+
+  // Mark selected as deleted so Save knows to skip originals
+  pendingIdealizeUuids.forEach(u => deletedUuids.add(u));
+
+  renderConversation();
+  updateButtons();
+  setStatus(`Applied idealized conversation. Click Save to write.`);
 }
 
 let pendingSummaryUuids = [];
@@ -892,7 +956,11 @@ async function executeSave() {
     const data = await inv('save_conversation', {
       project_id: currentProject,
       session_id: currentSession,
-      req: { keep_uuids: keepUuids },
+      req: {
+        keep_uuids: keepUuids,
+        deleted_uuids: pendingDeletedUuids,
+        insert_lines: pendingInsertLines,
+      },
     });
     setStatus(`Saved! ${formatSize(data.new_size)} · backup: ${data.backup}`);
     // Reload

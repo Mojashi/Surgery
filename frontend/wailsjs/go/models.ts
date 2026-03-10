@@ -121,6 +121,8 @@ export namespace main {
 	}
 	export class SaveRequest {
 	    keep_uuids: string[];
+	    deleted_uuids: string[];
+	    insert_lines: string[];
 	
 	    static createFrom(source: any = {}) {
 	        return new SaveRequest(source);
@@ -129,6 +131,8 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.keep_uuids = source["keep_uuids"];
+	        this.deleted_uuids = source["deleted_uuids"];
+	        this.insert_lines = source["insert_lines"];
 	    }
 	}
 	export class SaveResult {
