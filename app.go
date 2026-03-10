@@ -782,11 +782,13 @@ func (a *App) SummarizeMessages(projectID, sessionID string, uuids []string) (st
 		text := extractText(msg["content"])
 		if text != "" {
 			parts = append(parts, role+": "+text)
+		} else {
+			parts = append(parts, role+": [no text]")
 		}
 	}
 
 	if len(parts) == 0 {
-		return "", fmt.Errorf("no text content in selected messages")
+		return "", fmt.Errorf("no selected messages found")
 	}
 
 	prompt := "以下の会話を簡潔にサマリーしてください。重要な決定・発見・コンテキストを保持してください。サマリーのみ出力してください。\n\n" +
@@ -814,13 +816,41 @@ func extractText(content json.RawMessage) string {
 		if json.Unmarshal(item, &block) != nil {
 			continue
 		}
-		var t, text string
+		var t string
 		json.Unmarshal(block["type"], &t)
-		if t == "text" {
+		switch t {
+		case "text":
+			var text string
 			json.Unmarshal(block["text"], &text)
 			if text != "" {
 				texts = append(texts, text)
 			}
+		case "tool_use":
+			var name string
+			json.Unmarshal(block["name"], &name)
+			input, _ := json.Marshal(block["input"])
+			texts = append(texts, fmt.Sprintf("[tool_use: %s %s]", name, string(input)))
+		case "tool_result":
+			var resultText string
+			// content may be array or string
+			var sub []json.RawMessage
+			if json.Unmarshal(block["content"], &sub) == nil {
+				for _, s := range sub {
+					var sb map[string]json.RawMessage
+					json.Unmarshal(s, &sb)
+					var tx string
+					json.Unmarshal(sb["text"], &tx)
+					resultText += tx
+				}
+			} else {
+				json.Unmarshal(block["content"], &resultText)
+			}
+			if len(resultText) > 500 {
+				resultText = resultText[:500] + "…"
+			}
+			texts = append(texts, fmt.Sprintf("[tool_result: %s]", resultText))
+		case "thinking":
+			// skip thinking blocks
 		}
 	}
 	return strings.Join(texts, "\n")
