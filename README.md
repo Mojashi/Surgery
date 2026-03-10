@@ -1,19 +1,55 @@
-# README
+# Surgery ⚡
 
-## About
+Claude Code の会話履歴（JSONL）を編集するネイティブアプリ。不要なコンテキストを削ってトークンを節約する。
 
-This is the official Wails Vanilla template.
+## インストール
 
-You can configure the project by editing `wails.json`. More information about the project settings can be found
-here: https://wails.io/docs/reference/project-config
+[Releases](https://github.com/Mojashi/claude-conversation-editor/releases) から最新の `surgery-darwin-arm64.zip`（Apple Silicon）または `surgery-darwin-amd64.zip`（Intel）をダウンロードして展開。
 
-## Live Development
+```bash
+# ~/bin に配置する場合
+cp -r surgery.app /Applications/
+```
 
-To run in live development mode, run `wails dev` in the project directory. This will run a Vite development
-server that will provide very fast hot reload of your frontend changes. If you want to develop in a browser
-and have access to your Go methods, there is also a dev server that runs on http://localhost:34115. Connect
-to this in your browser, and you can call your Go code from devtools.
+`surgery` コマンドとして使うにはシェルスクリプトも同梱:
 
-## Building
+```bash
+ln -sf /path/to/surgery.sh ~/bin/surgery
+```
 
-To build a redistributable, production mode package, use `wails build`.
+## 使い方
+
+Claude Code のセッション内から:
+
+```bash
+surgery
+```
+
+1. ランダムトークンを出力して即終了
+2. バックグラウンドで現在のセッション JSONL を特定
+3. Surgery ウィンドウが開き、当該セッションにフォーカス
+
+### 操作
+
+- **チェックボックス**: 削除対象のメッセージを選択
+- **Shift+クリック**: 範囲選択
+- **✂ Truncate after**: そのメッセージ以降を全選択
+- **Tools / Sidechain**: tool_use・サイドチェーンの表示切替
+- **Delete Selected**: 選択をプレビュー
+- **Save**: JSONL に書き込み（`.jsonl.bak` に自動バックアップ）
+
+## 自動アップデート
+
+起動時に新バージョンがあればヘッダーに通知が出る。クリックで自動ダウンロード＆再起動。
+
+## ビルド
+
+```bash
+# 依存: Go 1.21+, Node 18+, Wails v2
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+wails build
+```
+
+## License
+
+MIT
