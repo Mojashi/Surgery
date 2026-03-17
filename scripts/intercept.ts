@@ -87,6 +87,56 @@ const server = Bun.serve({
       return new Response(respBody, { status: resp.status, headers: respHeaders });
     }
 
+    // For streaming responses, tee the stream to extract usage from SSE events
+    if (url.pathname.includes("/messages") && req.method === "POST" && resp.body) {
+      const [passThrough, inspect] = resp.body.tee();
+
+      // Read the inspect stream in background to extract usage
+      const reqNum = counter;
+      (async () => {
+        try {
+          const reader = inspect.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          let usage: any = null;
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            // Parse SSE events from buffer
+            const lines = buf.split("\n");
+            buf = lines.pop() || "";
+            for (const line of lines) {
+              if (!line.startsWith("data: ")) continue;
+              const payload = line.slice(6).trim();
+              if (payload === "[DONE]") continue;
+              try {
+                const evt = JSON.parse(payload);
+                // message_start has initial usage
+                if (evt.type === "message_start" && evt.message?.usage) {
+                  usage = { ...evt.message.usage };
+                }
+                // message_delta has final usage (output tokens)
+                if (evt.type === "message_delta" && evt.usage) {
+                  usage = { ...usage, ...evt.usage };
+                }
+              } catch {}
+            }
+          }
+          if (usage) {
+            console.error(`  #${reqNum} usage: input=${usage.input_tokens} output=${usage.output_tokens} cache_create=${usage.cache_creation_input_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0}`);
+            // Save usage alongside request
+            const usagePath = `/tmp/intercept-${port}-${reqNum}-usage.json`;
+            await Bun.write(usagePath, JSON.stringify(usage, null, 2));
+          }
+        } catch (e) {
+          console.error(`  #${reqNum} usage extraction error: ${e}`);
+        }
+      })();
+
+      return new Response(passThrough, { status: resp.status, headers: respHeaders });
+    }
+
     return new Response(resp.body, { status: resp.status, headers: respHeaders });
   },
 });

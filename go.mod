@@ -1,6 +1,6 @@
 module cc-editor-wails
 
-go 1.23
+go 1.25.0
 
 require github.com/wailsapp/wails/v2 v2.11.0
 
@@ -31,7 +31,7 @@ require (
 	golang.org/x/crypto v0.33.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
-	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/text v0.35.0 // indirect
 )
 
 // replace github.com/wailsapp/wails/v2 v2.11.0 => /Users/mojashi/.asdf/installs/golang/1.24.0/packages/pkg/mod

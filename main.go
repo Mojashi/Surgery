@@ -40,13 +40,22 @@ func main() {
 		// Open Wails window, optionally with a specific session
 		runGUI(argStr(args, 1), argStr(args, 2))
 
+	case len(args) >= 1 && args[0] == "--bg":
+		// Background: wait for token in JSONL, then run command
+		// Args: --bg <token> <command> [extra-args...]
+		runBg(args[1:])
+
 	case len(args) >= 1 && args[0] == "--watch":
-		// Background: grep for token, then open window
-		runWatch(argStr(args, 1), argStr(args, 2), argStr(args, 3))
+		// Legacy: redirect to --bg open
+		runBg([]string{argStr(args, 1), "open"})
 
 	case len(args) >= 1 && args[0] == "--compact-run":
-		// Background: grep for token, then run compaction
-		runCompactBackground(args[1:])
+		// Legacy: redirect to --bg compact
+		runBg(append([]string{argStr(args, 1), "compact"}, args[2:]...))
+
+	case len(args) >= 1 && args[0] == "--compact-window":
+		// Open compact dialog with a JSONL path
+		runCompactWindow(argStr(args, 1))
 
 	case len(args) >= 1 && args[0] == "--notify":
 		// Show a notification popup (title from arg, message from stdin)
@@ -81,26 +90,42 @@ func deriveProjectID() string {
 	return "-" + strings.ReplaceAll(strings.TrimPrefix(cwd, "/"), "/", "-")
 }
 
-func runSurgery() {
+// spawnBackground prints a token for Claude Code session detection,
+// then spawns a background process: --bg <token> <command> [args...]
+func spawnBackground(command string, extraArgs ...string) {
 	b := make([]byte, 8)
 	rand.Read(b)
 	token := "SURGERY_" + strings.ToUpper(hex.EncodeToString(b))
 	fmt.Println(token)
 
-	projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
-
+	bgArgs := append([]string{"--bg", token, command}, extraArgs...)
 	exe, _ := os.Executable()
-	cmd := exec.Command(exe, "--watch", token, projectsBase)
+	cmd := exec.Command(exe, bgArgs...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	cmd.Start()
 	cmd.Process.Release()
 	os.Exit(0)
 }
 
-func runWatch(token, projectsBase, _ string) {
-	// Search all project directories for the JSONL containing our token
+func runSurgery() {
+	spawnBackground("open")
+}
+
+// runBg is the unified background handler.
+// Args: <token> <command> [extra-args...]
+// It waits for the token to appear in a JSONL, then dispatches by command.
+func runBg(args []string) {
+	if len(args) < 2 {
+		os.Exit(1)
+	}
+	token := args[0]
+	command := args[1]
+
+	projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
+
+	// Wait for token to appear in a JSONL file
 	var jsonlPath, foundProjectID string
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 20; i++ {
 		time.Sleep(500 * time.Millisecond)
 		jsonlPath, foundProjectID = findJSONLWithTokenAllProjects(token, projectsBase)
 		if jsonlPath != "" {
@@ -108,12 +133,26 @@ func runWatch(token, projectsBase, _ string) {
 		}
 	}
 	if jsonlPath == "" {
+		spawnNotify("Surgery", "Error: could not find session JSONL file.")
 		return
 	}
 	sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
 
+	switch command {
+	case "open":
+		exe, _ := os.Executable()
+		cmd := exec.Command(exe, "--open", foundProjectID, sessionID)
+		cmd.Start()
+
+	case "compact":
+		spawnCompactWindow(jsonlPath)
+	}
+}
+
+// spawnCompactWindow opens the compact dialog window (which runs processing inside).
+func spawnCompactWindow(jsonlPath string) {
 	exe, _ := os.Executable()
-	cmd := exec.Command(exe, "--open", foundProjectID, sessionID)
+	cmd := exec.Command(exe, "--compact-window", jsonlPath)
 	cmd.Start()
 }
 
@@ -310,21 +349,16 @@ func cliUpdate(downloadURL, newVersion string) error {
 
 func runCompactCLI(args []string) {
 	dryRun := false
-	var ruleNames []string
 	var sessionID string
 
-	// Parse flags
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--dry-run":
 			dryRun = true
-		case "--rules":
-			if i+1 < len(args) {
-				i++
-				ruleNames = strings.Split(args[i], ",")
-			}
 		case "--help", "-h":
-			printCompactUsage()
+			fmt.Fprintln(os.Stderr, "Usage: surgery compact [session-id] [--dry-run]")
+			fmt.Fprintln(os.Stderr, "  Renders conversation history as images for token efficiency.")
+			fmt.Fprintln(os.Stderr, "  Without --dry-run, opens GUI for preview and apply.")
 			os.Exit(0)
 		default:
 			if !strings.HasPrefix(args[i], "-") && sessionID == "" {
@@ -333,52 +367,40 @@ func runCompactCLI(args []string) {
 		}
 	}
 
-	// If explicit session ID given, run directly
+	// Inside Claude Code: use token-based session detection
+	if os.Getenv("CLAUDECODE") == "1" {
+		spawnBackground("compact")
+		return
+	}
+
+	ruleNames := []string{"text-to-image"}
+
+	// Find session
+	var jsonlPath string
 	if sessionID != "" {
 		projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
-		jsonlPath := findSessionByID(projectsBase, sessionID)
+		jsonlPath = findSessionByID(projectsBase, sessionID)
 		if jsonlPath == "" {
 			fmt.Fprintln(os.Stderr, "Error: session not found:", sessionID)
 			os.Exit(1)
 		}
-		runCompactOnFile(jsonlPath, ruleNames, dryRun)
+	} else {
+		projectID := deriveProjectID()
+		projectDir := filepath.Join(os.Getenv("HOME"), ".claude", "projects", projectID)
+		jsonlPath = mostRecentJSONL(projectDir)
+		if jsonlPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: no session found for current directory.")
+			os.Exit(1)
+		}
+	}
+
+	if dryRun {
+		runCompactOnFile(jsonlPath, ruleNames, true)
 		return
 	}
 
-	// Inside Claude Code: token + background process, notify on completion
-	if os.Getenv("CLAUDECODE") == "1" {
-		b := make([]byte, 8)
-		rand.Read(b)
-		token := "SURGERY_COMPACT_" + strings.ToUpper(hex.EncodeToString(b))
-
-		bgArgs := []string{"--compact-run", token}
-		if dryRun {
-			bgArgs = append(bgArgs, "--dry-run")
-		}
-		if len(ruleNames) > 0 {
-			bgArgs = append(bgArgs, "--rules", strings.Join(ruleNames, ","))
-		}
-
-		exe, _ := os.Executable()
-		cmd := exec.Command(exe, bgArgs...)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		cmd.Start()
-		cmd.Process.Release()
-
-		fmt.Println(token)
-		fmt.Println("Compaction running in background. You'll get a notification when done.")
-		os.Exit(0)
-	}
-
-	// Standalone: most recent session in cwd-derived project
-	projectID := deriveProjectID()
-	projectDir := filepath.Join(filepath.Join(os.Getenv("HOME"), ".claude", "projects"), projectID)
-	jsonlPath := mostRecentJSONL(projectDir)
-	if jsonlPath == "" {
-		fmt.Fprintln(os.Stderr, "Error: no session found for current directory.")
-		os.Exit(1)
-	}
-	runCompactOnFile(jsonlPath, ruleNames, dryRun)
+	// Open compact dialog (processes inside the window)
+	runCompactWindow(jsonlPath)
 }
 
 // runCompactBackground is the background process spawned by "compact" under Claude Code.
@@ -389,18 +411,12 @@ func runCompactBackground(args []string) {
 	}
 	token := args[0]
 	dryRun := false
-	var ruleNames []string
 	for i := 1; i < len(args); i++ {
-		switch args[i] {
-		case "--dry-run":
+		if args[i] == "--dry-run" {
 			dryRun = true
-		case "--rules":
-			if i+1 < len(args) {
-				i++
-				ruleNames = strings.Split(args[i], ",")
-			}
 		}
 	}
+	ruleNames := []string{"text-to-image"}
 
 	projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
 
@@ -541,7 +557,7 @@ func allRulesIncludingExtras() []CompactRule {
 		all = append(all, r)
 		seen[r.Name()] = true
 	}
-	extras := []CompactRule{&StripFileHistoryRule{}, &StripErrorRetriesRule{}, &TruncateLargeBashRule{}}
+	extras := []CompactRule{&StripFileHistoryRule{}, &StripErrorRetriesRule{}, &TruncateLargeBashRule{}, &TextToImageRule{}}
 	for _, r := range extras {
 		if !seen[r.Name()] {
 			all = append(all, r)
@@ -569,6 +585,78 @@ func findSessionByID(projectsBase, sessionID string) string {
 		}
 	}
 	return ""
+}
+
+// --- Compact Window ---
+
+type CompactApp struct {
+	ctx      context.Context
+	jsonlPath string
+}
+
+func (c *CompactApp) startup(ctx context.Context) { c.ctx = ctx }
+
+// RunCompact is called from the frontend after the window is already visible.
+// It runs the full compact pipeline and returns the result.
+func (c *CompactApp) RunCompact() map[string]string {
+	if c.jsonlPath == "" {
+		return map[string]string{"error": "no session file"}
+	}
+
+	conv, err := LoadConversation(c.jsonlPath)
+	if err != nil {
+		return map[string]string{"error": fmt.Sprintf("load error: %v", err)}
+	}
+	beforeCount := conv.EntryCount()
+
+	// Build preview HTML before compaction
+	splitIdx := findImageBoundary(conv.Entries)
+	previewHTML := ""
+	if splitIdx >= 2 {
+		previewHTML = buildChatHTML(conv.Entries[:splitIdx])
+	}
+
+	// Run compaction
+	rules := selectRules([]string{"text-to-image"})
+	report := RunCompaction(conv, rules)
+
+	// Write new session
+	newID := generateUUID()
+	conv.SessionID = newID
+	for _, e := range conv.Entries {
+		e.SessionID = newID
+	}
+	dir := filepath.Dir(c.jsonlPath)
+	if err := conv.WriteToFile(filepath.Join(dir, newID+".jsonl")); err != nil {
+		return map[string]string{"error": fmt.Sprintf("write error: %v", err)}
+	}
+
+	var sb strings.Builder
+	formatCompactReport(&sb, filepath.Base(c.jsonlPath), beforeCount, conv.EntryCount(), report)
+
+	return map[string]string{
+		"session_id":   newID,
+		"html":         previewHTML,
+		"report":       sb.String(),
+		"resume_cmd":   "claude --resume " + newID,
+		"resume_slash": "/resume " + newID,
+	}
+}
+
+func runCompactWindow(jsonlPath string) {
+	app := &CompactApp{jsonlPath: jsonlPath}
+	wails.Run(&options.App{
+		Title:            "Surgery Compact",
+		Width:            1100,
+		Height:           700,
+		DisableResize:    false,
+		BackgroundColour: &options.RGBA{R: 13, G: 17, B: 23, A: 1},
+		AssetServer: &assetserver.Options{
+			Assets: assets,
+		},
+		OnStartup: app.startup,
+		Bind:      []interface{}{app},
+	})
 }
 
 // spawnNotify launches a new process with --notify to show a Wails popup.
@@ -641,7 +729,7 @@ func selectRules(names []string) []CompactRule {
 		all[r.Name()] = r
 	}
 	// Also register non-default rules
-	extras := []CompactRule{&StripFileHistoryRule{}, &StripErrorRetriesRule{}, &TruncateLargeBashRule{}}
+	extras := []CompactRule{&StripFileHistoryRule{}, &StripErrorRetriesRule{}, &TruncateLargeBashRule{}, &TextToImageRule{}}
 	for _, r := range extras {
 		all[r.Name()] = r
 	}

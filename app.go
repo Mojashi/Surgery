@@ -630,6 +630,70 @@ func (a *App) FastCompact(projectID, sessionID string, ruleNames []string, dryRu
 	return &report, nil
 }
 
+// CompactToImagePreview generates the chat-as-image HTML preview without applying.
+// Returns the HTML string to be displayed in an iframe.
+type CompactToImageResult struct {
+	HTML       string         `json:"html"`
+	Report     CompactReport  `json:"report"`
+	NewSession string         `json:"new_session"`
+}
+
+func (a *App) CompactToImagePreview(projectID, sessionID string) (*CompactToImageResult, error) {
+	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	conv, err := LoadConversation(path)
+	if err != nil {
+		return nil, fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	// Find boundary: keep last assistant turn and after as text
+	splitIdx := findImageBoundary(conv.Entries)
+	if splitIdx < 2 {
+		return nil, fmt.Errorf("not enough entries to convert")
+	}
+
+	toRender := conv.Entries[:splitIdx]
+	chatHTML := buildChatHTML(toRender)
+
+	// Dry-run the full rule to get the report
+	convCopy, _ := LoadConversation(path)
+	rules := selectRules([]string{"text-to-image"})
+	report := RunCompaction(convCopy, rules)
+
+	return &CompactToImageResult{
+		HTML:   chatHTML,
+		Report: report,
+	}, nil
+}
+
+// CompactToImageApply runs text-to-image compact and saves to a new session file.
+func (a *App) CompactToImageApply(projectID, sessionID string) (*CompactToImageResult, error) {
+	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")
+	conv, err := LoadConversation(path)
+	if err != nil {
+		return nil, fmt.Errorf("session not found: %s", sessionID)
+	}
+
+	rules := selectRules([]string{"text-to-image"})
+	report := RunCompaction(conv, rules)
+
+	// Write to new session file
+	newID := generateUUID()
+	conv.SessionID = newID
+	for _, e := range conv.Entries {
+		e.SessionID = newID
+	}
+	dir := filepath.Join(claudeDir(), projectID)
+	newPath := filepath.Join(dir, newID+".jsonl")
+	if err := conv.WriteToFile(newPath); err != nil {
+		return nil, err
+	}
+
+	return &CompactToImageResult{
+		Report:     report,
+		NewSession: newID,
+	}, nil
+}
+
 // ValidateSession checks a session for chain and tool pairing issues.
 func (a *App) ValidateSession(projectID, sessionID string) ([]ChainIssue, error) {
 	path := filepath.Join(claudeDir(), projectID, sessionID+".jsonl")

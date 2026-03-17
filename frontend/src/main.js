@@ -1,43 +1,39 @@
 import './style.css';
-import './app.css';
+import { initCompactMode, initNotifyMode } from './modes.js';
 
-import logo from './assets/images/logo-universal.png';
-import {Greet} from '../wailsjs/go/main/App';
+function waitForWails(cb) {
+  if (window.go?.main?.App || window.go?.main?.NotifyApp || window.go?.main?.CompactApp) { cb(); return; }
+  setTimeout(() => waitForWails(cb), 50);
+}
 
-document.querySelector('#app').innerHTML = `
-    <img id="logo" class="logo">
-      <div class="result" id="result">Please enter your name below 👇</div>
-      <div class="input-box" id="input">
-        <input class="input" id="name" type="text" autocomplete="off" />
-        <button class="btn" onclick="greet()">Greet</button>
-      </div>
-    </div>
-`;
-document.getElementById('logo').src = logo;
+waitForWails(async () => {
+  // Compact mode — standalone window
+  if (window.go?.main?.CompactApp) {
+    await initCompactMode();
+    return;
+  }
 
-let nameElement = document.getElementById("name");
-nameElement.focus();
-let resultElement = document.getElementById("result");
+  // Notify popup mode — standalone window
+  if (window.go?.main?.NotifyApp) {
+    await initNotifyMode();
+    return;
+  }
 
-// Setup the greet function
-window.greet = function () {
-    // Get name
-    let name = nameElement.value;
+  // Main editor mode
+  await import('./editor.js');
 
-    // Check if the input is empty
-    if (name === "") return;
+  const go = window.go.main.App;
 
-    // Call App.Greet(name)
-    try {
-        Greet(name)
-            .then((result) => {
-                // Update result with data back from App.Greet()
-                resultElement.innerText = result;
-            })
-            .catch((err) => {
-                console.error(err);
-            });
-    } catch (err) {
-        console.error(err);
-    }
-};
+  const args = await go.GetStartupArgs();
+  if (args.project && args.session) {
+    await window.loadProjects();
+    const pel = document.querySelector(`#project-list [data-id="${args.project}"]`);
+    if (pel) { pel.classList.add('active'); window.setCurrentProject(args.project); }
+    await window.loadSessions(args.project);
+    const sel = document.querySelector(`#session-list [data-id="${args.session}"]`);
+    if (sel) { sel.classList.add('active'); await window.selectSession(args.session, sel); }
+  } else {
+    window.initFromHash();
+  }
+  window.checkUpdate();
+});
