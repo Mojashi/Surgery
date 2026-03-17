@@ -326,8 +326,9 @@ func TestCompactPreservesMessageID(t *testing.T) {
 	}
 }
 
-// TestTruncateOldReads verifies non-last Reads are truncated.
+// TestTruncateOldReads verifies redundant Reads are truncated.
 func TestTruncateOldReads(t *testing.T) {
+	bigContent := strings.Repeat("line content here\n", 300) // ~5400 chars
 	entries := []*JSONLEntry{
 		makeEntry("a", "", "user", "hello"),
 		makeEntryWithMessage("b", "a", "assistant", &EntryMessage{
@@ -340,10 +341,10 @@ func TestTruncateOldReads(t *testing.T) {
 		makeEntryWithMessage("c", "b", "user", &EntryMessage{
 			Role: "user",
 			Content: mustMarshal([]map[string]interface{}{
-				{"type": "tool_result", "tool_use_id": "tu1", "content": strings.Repeat("x", 5000)},
+				{"type": "tool_result", "tool_use_id": "tu1", "content": bigContent},
 			}),
 		}),
-		// Second Read (last) — should be kept
+		// Second Read (same content — redundant)
 		makeEntryWithMessage("d", "c", "assistant", &EntryMessage{
 			Role: "assistant",
 			Content: mustMarshal([]map[string]interface{}{
@@ -354,7 +355,7 @@ func TestTruncateOldReads(t *testing.T) {
 		makeEntryWithMessage("e", "d", "user", &EntryMessage{
 			Role: "user",
 			Content: mustMarshal([]map[string]interface{}{
-				{"type": "tool_result", "tool_use_id": "tu2", "content": "updated content"},
+				{"type": "tool_result", "tool_use_id": "tu2", "content": bigContent},
 			}),
 		}),
 	}
@@ -366,23 +367,23 @@ func TestTruncateOldReads(t *testing.T) {
 		t.Error("expected bytes saved > 0")
 	}
 
-	// First Read truncated
+	// Second Read truncated (same content, already known)
 	var blocks []json.RawMessage
-	json.Unmarshal(entries[2].Message.Content, &blocks)
+	json.Unmarshal(entries[4].Message.Content, &blocks) // entry "e"
 	var b map[string]json.RawMessage
 	json.Unmarshal(blocks[0], &b)
 	var content string
 	json.Unmarshal(b["content"], &content)
-	if !strings.Contains(content, "see later read") {
-		t.Errorf("first Read should be truncated, got: %s", content[:100])
+	if !strings.Contains(content, "already in context") {
+		t.Errorf("redundant Read should be truncated, got: %s", content[:60])
 	}
 
-	// Last Read kept
-	json.Unmarshal(entries[4].Message.Content, &blocks)
+	// First Read kept
+	json.Unmarshal(entries[2].Message.Content, &blocks) // entry "c"
 	json.Unmarshal(blocks[0], &b)
 	json.Unmarshal(b["content"], &content)
-	if content != "updated content" {
-		t.Errorf("last Read should be kept, got: %s", content)
+	if strings.Contains(content, "already in context") {
+		t.Error("first Read should NOT be truncated")
 	}
 }
 

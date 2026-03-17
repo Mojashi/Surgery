@@ -218,22 +218,37 @@ func (r *StripCwdRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleR
 }
 
 // --- Rule: TruncateOldReadsRule ---
-// For each file, keeps only the LAST Read's full content.
-// Earlier Reads are replaced with a short placeholder.
+// Tracks known line ranges per file and truncates Read results whose
+// lines are already in context.
+//
+// Known lines are updated by:
+//   - Read: lines returned become known (respecting offset/limit)
+//   - Write: ALL lines become known (full file replacement)
+//   - Edit: old_string lines removed from known, new_string lines added
+//
+// A Read is truncated only if ALL its lines are already known.
 
 type TruncateOldReadsRule struct{}
 
 func (r *TruncateOldReadsRule) Name() string { return "truncate-old-reads" }
 func (r *TruncateOldReadsRule) Description() string {
-	return "Truncate non-last Read results per file"
+	return "Truncate Read results whose lines are already in context"
 }
 
 func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleReport) {
 	report := CompactRuleReport{BytesBefore: entriesSize(entries)}
 	truncated := 0
 
-	// Pass 1: collect all Read tool_use IDs → file_path
-	readToolUses := map[string]string{} // tool_use_id → file_path
+	// Collect tool_use info
+	type toolUseInfo struct {
+		name     string
+		filePath string
+		offset   int
+		limit    int
+		input    json.RawMessage // for Write/Edit content extraction
+	}
+	tuMap := map[string]toolUseInfo{}
+
 	for _, e := range entries {
 		if e.Message == nil || e.Type != "assistant" {
 			continue
@@ -249,51 +264,35 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 			}
 			var typ, id, name string
 			json.Unmarshal(b["type"], &typ)
-			if typ == "tool_use" {
-				json.Unmarshal(b["id"], &id)
-				json.Unmarshal(b["name"], &name)
-				if name == "Read" {
-					var input struct {
-						FilePath string `json:"file_path"`
-					}
-					json.Unmarshal(b["input"], &input)
-					if input.FilePath != "" {
-						readToolUses[id] = input.FilePath
-					}
-				}
-			}
-		}
-	}
-
-	// Pass 2: find the LAST Read tool_result per file
-	lastReadID := map[string]string{} // file_path → last tool_use_id
-	for _, e := range entries {
-		if e.Message == nil || e.Type != "user" {
-			continue
-		}
-		var blocks []json.RawMessage
-		if json.Unmarshal(e.Message.Content, &blocks) != nil {
-			continue
-		}
-		for _, block := range blocks {
-			var b map[string]json.RawMessage
-			if json.Unmarshal(block, &b) != nil {
+			if typ != "tool_use" {
 				continue
 			}
-			var typ, toolUseID string
-			json.Unmarshal(b["type"], &typ)
-			if typ == "tool_result" {
-				json.Unmarshal(b["tool_use_id"], &toolUseID)
-				if fp, ok := readToolUses[toolUseID]; ok {
-					lastReadID[fp] = toolUseID
-				}
+			json.Unmarshal(b["id"], &id)
+			json.Unmarshal(b["name"], &name)
+			var input struct {
+				FilePath  string `json:"file_path"`
+				Offset    int    `json:"offset"`
+				Limit     int    `json:"limit"`
+				Content   string `json:"content"`
+				OldString string `json:"old_string"`
+				NewString string `json:"new_string"`
+			}
+			json.Unmarshal(b["input"], &input)
+			tuMap[id] = toolUseInfo{
+				name:     name,
+				filePath: input.FilePath,
+				offset:   input.Offset,
+				limit:    input.Limit,
+				input:    b["input"],
 			}
 		}
 	}
 
-	// Pass 3: truncate all non-last Read results
+	// Walk forward, tracking known lines per file (line number → content hash)
+	knownLines := map[string]map[int]string{} // file → line number → line content
+
 	for _, e := range entries {
-		if e.Message == nil || e.Type != "user" {
+		if e.Message == nil {
 			continue
 		}
 		var blocks []json.RawMessage
@@ -301,6 +300,71 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 			continue
 		}
 
+		// Process assistant tool_use: Write/Edit update known lines
+		if e.Type == "assistant" {
+			for _, block := range blocks {
+				var b map[string]json.RawMessage
+				if json.Unmarshal(block, &b) != nil {
+					continue
+				}
+				var typ, id string
+				json.Unmarshal(b["type"], &typ)
+				if typ != "tool_use" {
+					continue
+				}
+				json.Unmarshal(b["id"], &id)
+				info := tuMap[id]
+
+				switch info.name {
+				case "Write":
+					// Write replaces entire file — all written lines are known
+					var inp struct {
+						Content string `json:"content"`
+					}
+					json.Unmarshal(info.input, &inp)
+					if inp.Content != "" && info.filePath != "" {
+						lines := strings.Split(inp.Content, "\n")
+						known := make(map[int]string, len(lines))
+						for j, line := range lines {
+							known[j+1] = line
+						}
+						knownLines[info.filePath] = known
+					}
+
+				case "Edit":
+					// Edit replaces old_string with new_string.
+					// Remove known lines matching old_string content,
+					// add new_string lines as known.
+					var inp struct {
+						OldString string `json:"old_string"`
+						NewString string `json:"new_string"`
+					}
+					json.Unmarshal(info.input, &inp)
+					if info.filePath != "" {
+						known := knownLines[info.filePath]
+						if known != nil {
+							// Remove lines matching old_string
+							oldLines := strings.Split(inp.OldString, "\n")
+							for lineNum, lineContent := range known {
+								for _, oldLine := range oldLines {
+									if strings.TrimSpace(lineContent) == strings.TrimSpace(oldLine) {
+										delete(known, lineNum)
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+			continue
+		}
+
+		if e.Type != "user" {
+			continue
+		}
+
+		// Process tool_results
 		modified := false
 		for i, block := range blocks {
 			var b map[string]json.RawMessage
@@ -313,10 +377,11 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 				continue
 			}
 			json.Unmarshal(b["tool_use_id"], &toolUseID)
-			filePath, isRead := readToolUses[toolUseID]
-			if !isRead {
+			info := tuMap[toolUseID]
+			if info.name != "Read" || info.filePath == "" {
 				continue
 			}
+
 			var isErr bool
 			if errField, ok := b["is_error"]; ok {
 				json.Unmarshal(errField, &isErr)
@@ -324,21 +389,100 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 			if isErr {
 				continue
 			}
-			if lastReadID[filePath] == toolUseID {
-				continue // keep the last Read
+
+			var content string
+			if json.Unmarshal(b["content"], &content) != nil {
+				continue
+			}
+			lines := strings.Split(content, "\n")
+			if len(lines) == 0 {
+				continue
 			}
 
-			origSize := len(b["content"])
-			shortName := filePath
-			if idx := strings.LastIndex(filePath, "/"); idx >= 0 {
-				shortName = filePath[idx+1:]
+			startLine := 1
+			if info.offset > 0 {
+				startLine = info.offset
 			}
-			placeholder := fmt.Sprintf("[Read %s — %s, see later read]",
-				shortName, humanBytes(int64(origSize)))
-			b["content"], _ = json.Marshal(placeholder)
-			blocks[i], _ = json.Marshal(b)
-			modified = true
-			truncated++
+
+			known := knownLines[info.filePath]
+			if known == nil {
+				known = make(map[int]string)
+				knownLines[info.filePath] = known
+			}
+
+			alreadyKnown := 0
+			for j, line := range lines {
+				if prev, ok := known[startLine+j]; ok && prev == line {
+					alreadyKnown++
+				}
+			}
+
+			if alreadyKnown == len(lines) {
+				// All lines already known → full truncate
+				shortName := info.filePath
+				if idx := strings.LastIndex(info.filePath, "/"); idx >= 0 {
+					shortName = info.filePath[idx+1:]
+				}
+				placeholder := fmt.Sprintf("[Read %s — %d lines already in context]",
+					shortName, len(lines))
+				b["content"], _ = json.Marshal(placeholder)
+				blocks[i], _ = json.Marshal(b)
+				modified = true
+				truncated++
+			} else if alreadyKnown > 0 && len(content) > 200 {
+				// Partial overlap — keep only new lines, collapse known ranges
+				var sb strings.Builder
+				knownRunStart := -1
+				knownRunCount := 0
+
+				flushKnownRun := func() {
+					if knownRunCount > 0 {
+						if knownRunCount == 1 {
+							sb.WriteString(fmt.Sprintf("[line %d — already in context]\n", knownRunStart))
+						} else {
+							sb.WriteString(fmt.Sprintf("[lines %d-%d — %d lines already in context]\n",
+								knownRunStart, knownRunStart+knownRunCount-1, knownRunCount))
+						}
+						knownRunStart = -1
+						knownRunCount = 0
+					}
+				}
+
+				for j, line := range lines {
+					lineNum := startLine + j
+					if prev, ok := known[lineNum]; ok && prev == line {
+						if knownRunCount == 0 {
+							knownRunStart = lineNum
+						}
+						knownRunCount++
+					} else {
+						flushKnownRun()
+						sb.WriteString(line)
+						if j < len(lines)-1 {
+							sb.WriteByte('\n')
+						}
+					}
+				}
+				flushKnownRun()
+
+				result := sb.String()
+				if len(result) < len(content) {
+					b["content"], _ = json.Marshal(result)
+					blocks[i], _ = json.Marshal(b)
+					modified = true
+					truncated++
+				}
+
+				// Mark all lines as known
+				for j, line := range lines {
+					known[startLine+j] = line
+				}
+			} else {
+				// Mark lines as known
+				for j, line := range lines {
+					known[startLine+j] = line
+				}
+			}
 		}
 
 		if modified {
@@ -349,7 +493,7 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 	report.BytesAfter = entriesSize(entries)
 	report.BytesSaved = report.BytesBefore - report.BytesAfter
 	if truncated > 0 {
-		report.Details = append(report.Details, fmt.Sprintf("truncated %d old Read results", truncated))
+		report.Details = append(report.Details, fmt.Sprintf("truncated %d redundant Read results", truncated))
 	}
 	return entries, report
 }
