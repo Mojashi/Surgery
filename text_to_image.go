@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 )
+
+//go:embed scripts/html2png
+var html2pngBin []byte
 
 // --- Rule: TextToImageRule ---
 // Renders the entire conversation as a chat-style HTML document and converts
@@ -24,22 +27,11 @@ type TextToImageRule struct{}
 
 func (r *TextToImageRule) Name() string { return "text-to-image" }
 func (r *TextToImageRule) Description() string {
-	return "Render conversation as chat images via weasyprint (experimental)"
+	return "Render conversation as chat images via WebKit (experimental)"
 }
 
 func (r *TextToImageRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleReport) {
 	report := CompactRuleReport{BytesBefore: entriesSize(entries)}
-
-	if _, err := exec.LookPath("weasyprint"); err != nil {
-		report.Details = append(report.Details, "weasyprint not found in PATH, skipping")
-		report.BytesAfter = report.BytesBefore
-		return entries, report
-	}
-	if _, err := exec.LookPath("magick"); err != nil {
-		report.Details = append(report.Details, "magick not found in PATH, skipping")
-		report.BytesAfter = report.BytesBefore
-		return entries, report
-	}
 
 	// We keep the last assistant+user turn pair as text (so Claude can continue).
 	// Everything before that gets rendered as images.
@@ -53,11 +45,9 @@ func (r *TextToImageRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRu
 	toRender := entries[:splitIdx]
 	toKeep := entries[splitIdx:]
 
-	// Build chat HTML from entries to render
-	chatHTML := buildChatHTML(toRender)
-
 	// Render to page images
-	pngPages, err := renderHTMLToImages(chatHTML)
+	chatHTML := buildChatHTML(toRender)
+	pngPages, err := renderHTMLBatch([]string{chatHTML}, nil)
 	if err != nil {
 		report.Details = append(report.Details, fmt.Sprintf("render failed: %v", err))
 		report.BytesAfter = report.BytesBefore
@@ -71,7 +61,7 @@ func (r *TextToImageRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRu
 			"type": "image",
 			"source": map[string]string{
 				"type":       "base64",
-				"media_type": "image/png",
+				"media_type": detectImageMediaType(pngData),
 				"data":       base64.StdEncoding.EncodeToString(pngData),
 			},
 		})
@@ -194,7 +184,7 @@ func buildChatSections(entries []*JSONLEntry) string {
 }
 
 const chatHTMLStyle = `@page {
-  size: 1200px 900px;
+  size: 784px 1568px;
   margin: 0;
 }
 body {
@@ -269,101 +259,128 @@ func renderHTMLChunksParallel(entries []*JSONLEntry, chunkSize int, progressFn f
 		return nil, fmt.Errorf("no entries to render")
 	}
 
-	// Render each chunk's HTML
+	// Build HTML for each chunk
 	htmlDocs := make([]string, len(chunks))
 	for i, chunk := range chunks {
 		htmlDocs[i] = wrapChatHTML(buildChatSections(chunk))
 	}
 
-	// Render all chunks in parallel
-	type chunkResult struct {
-		index int
-		pages [][]byte
-		err   error
-	}
-	results := make([]chunkResult, len(htmlDocs))
-	var wg sync.WaitGroup
-	completed := 0
-	var mu sync.Mutex
-
-	for i, doc := range htmlDocs {
-		wg.Add(1)
-		go func(idx int, html string) {
-			defer wg.Done()
-			start := time.Now()
-			pages, err := renderHTMLToImages(html)
-			fmt.Fprintf(os.Stderr, "  chunk %d: %v (%d pages)\n", idx, time.Since(start).Round(time.Millisecond), len(pages))
-			results[idx] = chunkResult{index: idx, pages: pages, err: err}
-			mu.Lock()
-			completed++
-			if progressFn != nil {
-				progressFn(completed, len(htmlDocs))
-			}
-			mu.Unlock()
-		}(i, doc)
-	}
-	wg.Wait()
-
-	// Collect all pages in order
-	var allPages [][]byte
-	for _, r := range results {
-		if r.err != nil {
-			return nil, fmt.Errorf("chunk %d: %w", r.index, r.err)
-		}
-		allPages = append(allPages, r.pages...)
+	// Render all chunks in a single batch process (one WKWebView, no repeated compilation)
+	allPages, err := renderHTMLBatch(htmlDocs, progressFn)
+	if err != nil {
+		return nil, err
 	}
 	return allPages, nil
 }
 
-// renderHTMLToImages renders a single HTML to PNG images.
-func renderHTMLToImages(htmlContent string) ([][]byte, error) {
+// renderHTMLBatch sends all HTML docs to a single Swift process for batch rendering.
+func renderHTMLBatch(htmlDocs []string, progressFn func(int, int)) ([][]byte, error) {
 	tmpDir, err := os.MkdirTemp("", "surgery-img-*")
 	if err != nil {
 		return nil, err
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		// Copy to debug dir
+		debugDir := filepath.Join(os.TempDir(), "surgery-compact-debug")
+		os.MkdirAll(debugDir, 0755)
+		files, _ := os.ReadDir(tmpDir)
+		for _, f := range files {
+			src := filepath.Join(tmpDir, f.Name())
+			dst := filepath.Join(debugDir, f.Name())
+			if data, err := os.ReadFile(src); err == nil {
+				os.WriteFile(dst, data, 0644)
+			}
+		}
+	}()
 
-	htmlPath := filepath.Join(tmpDir, "input.html")
-	pdfPath := filepath.Join(tmpDir, "output.pdf")
-	pngPattern := filepath.Join(tmpDir, "output.png")
-
-	if err := os.WriteFile(htmlPath, []byte(htmlContent), 0644); err != nil {
+	// Compile Swift script once (cached)
+	binPath, err := ensureHTML2PNGBinary(tmpDir)
+	if err != nil {
 		return nil, err
 	}
 
-	// weasyprint HTML → PDF
-	cmd := exec.Command("weasyprint", htmlPath, pdfPath, "--presentational-hints")
+	// Build batch jobs JSON
+	type batchJob struct {
+		HTML   string `json:"html"`
+		Prefix string `json:"prefix"`
+	}
+	var jobs []batchJob
+	for i, html := range htmlDocs {
+		jobs = append(jobs, batchJob{HTML: html, Prefix: fmt.Sprintf("chunk%d", i)})
+	}
+	jobsJSON, _ := json.Marshal(jobs)
+
+	// Run batch
+	start := time.Now()
+	cmd := exec.Command(binPath, tmpDir)
+	cmd.Stdin = bytes.NewReader(jobsJSON)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("weasyprint: %v: %s", err, stderr.String())
+		return nil, fmt.Errorf("html2png batch: %v: %s", err, stderr.String())
 	}
+	fmt.Fprintf(os.Stderr, "  render: %v\n", time.Since(start).Round(time.Millisecond))
 
-	// magick PDF → PNG per page, trimmed
-	cmd = exec.Command("magick", "-density", "144", pdfPath, "-trim", "+repage", pngPattern)
-	stderr.Reset()
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("magick: %v: %s", err, stderr.String())
-	}
+	// Collect all pages in chunk order, converting to WebP if possible
+	_, cwebpErr := exec.LookPath("cwebp")
+	hasWebP := cwebpErr == nil
 
-	// Collect pages
-	var pages [][]byte
-	if data, err := os.ReadFile(pngPattern); err == nil {
-		pages = append(pages, data)
-	} else {
-		for i := 0; ; i++ {
-			data, err := os.ReadFile(filepath.Join(tmpDir, fmt.Sprintf("output-%d.png", i)))
-			if err != nil {
-				break
+	var allPages [][]byte
+	for i := range htmlDocs {
+		prefix := fmt.Sprintf("chunk%d", i)
+		// Try single page
+		singlePath := filepath.Join(tmpDir, prefix+".png")
+		if _, err := os.Stat(singlePath); err == nil {
+			allPages = append(allPages, convertPage(singlePath, hasWebP))
+		} else {
+			// Multi-page
+			for j := 0; ; j++ {
+				pagePath := filepath.Join(tmpDir, fmt.Sprintf("%s-%d.png", prefix, j))
+				if _, err := os.Stat(pagePath); err != nil {
+					break
+				}
+				allPages = append(allPages, convertPage(pagePath, hasWebP))
 			}
-			pages = append(pages, data)
+		}
+		if progressFn != nil {
+			progressFn(i+1, len(htmlDocs))
 		}
 	}
-	if len(pages) == 0 {
-		return nil, fmt.Errorf("no PNG output generated")
+	if len(allPages) == 0 {
+		return nil, fmt.Errorf("no output generated")
 	}
-	return pages, nil
+	return allPages, nil
+}
+
+func convertPage(pngPath string, hasWebP bool) []byte {
+	if hasWebP {
+		webpPath := strings.TrimSuffix(pngPath, ".png") + ".webp"
+		cmd := exec.Command("cwebp", "-q", "85", pngPath, "-o", webpPath)
+		if cmd.Run() == nil {
+			if data, err := os.ReadFile(webpPath); err == nil {
+				return data
+			}
+		}
+	}
+	data, _ := os.ReadFile(pngPath)
+	return data
+}
+
+// ensureHTML2PNGBinary extracts the embedded pre-compiled binary to a temp path.
+var html2pngBinaryPath string
+
+func ensureHTML2PNGBinary(_ string) (string, error) {
+	if html2pngBinaryPath != "" {
+		if _, err := os.Stat(html2pngBinaryPath); err == nil {
+			return html2pngBinaryPath, nil
+		}
+	}
+	binPath := filepath.Join(os.TempDir(), "surgery-html2png")
+	if err := os.WriteFile(binPath, html2pngBin, 0755); err != nil {
+		return "", err
+	}
+	html2pngBinaryPath = binPath
+	return binPath, nil
 }
 
 func renderChatBubble(role, content string) string {

@@ -9,10 +9,6 @@ async function inv(cmd, args) {
     if (cmd === 'edit_message') return go.EditMessage(args.project_id, args.session_id, args.uuid, args.new_text);
     if (cmd === 'branch_new_session') return go.BranchNewSession(args.project_id, args.session_id, args.uuid);
     if (cmd === 'restore_sidechain') return go.RestoreSidechain(args.project_id, args.session_id, args.uuid);
-    if (cmd === 'summarize_messages') return go.SummarizeMessages(args.project_id, args.session_id, args.uuids);
-    if (cmd === 'apply_summary') return go.ApplySummary(args.project_id, args.session_id, args.uuids, args.summary);
-    if (cmd === 'idealize_messages') return go.IdealizeMessages(args.project_id, args.session_id, args.uuids);
-    if (cmd === 'apply_idealized') return go.ApplyIdealized(args.project_id, args.session_id, args.uuids, args.messages_json);
     if (cmd === 'exec_claude') return go.ExecClaude(args.project_id, args.session_id, args.skip_permissions, args.terminal);
     if (cmd === 'get_available_terminals') return go.GetAvailableTerminals();
     if (cmd === 'get_claude_command') return go.GetClaudeCommand(args.project_id, args.session_id, args.skip_permissions);
@@ -528,127 +524,6 @@ async function execClaude() {
   }
 }
 
-let pendingIdealizeUuids = [];
-
-async function startIdealize() {
-  if (deletedUuids.size === 0) return;
-  pendingIdealizeUuids = [...deletedUuids];
-  document.getElementById('idealize-desc').textContent =
-    `${pendingIdealizeUuids.length} messages selected. Generating idealized conversation...`;
-  document.getElementById('idealize-ta').value = '';
-  document.getElementById('idealize-preview').innerHTML = '';
-  document.getElementById('idealize-apply-btn').disabled = true;
-  document.getElementById('idealize-overlay').classList.add('show');
-  setStatus('Idealizing with Claude...');
-
-  // Stream tokens into textarea as they arrive
-  if (window.runtime) {
-    window.runtime.EventsOn('claude:stream', (line) => {
-      try {
-        const ev = JSON.parse(line);
-        const msg = ev?.message?.content;
-        if (Array.isArray(msg)) {
-          msg.forEach(b => {
-            if (b.type === 'text' && b.text) {
-              document.getElementById('idealize-ta').value += b.text;
-            }
-          });
-        }
-      } catch(_) {}
-    });
-  }
-
-  try {
-    const raw = await inv('idealize_messages', {
-      project_id: currentProject,
-      session_id: currentSession,
-      uuids: pendingIdealizeUuids,
-    });
-    if (window.runtime) window.runtime.EventsOff('claude:stream');
-    // Handle possible double-JSON-encoding
-    let parsed = JSON.parse(raw);
-    if (typeof parsed === 'string') parsed = JSON.parse(parsed);
-    document.getElementById('idealize-ta').value = JSON.stringify(parsed, null, 2);
-    console.log('idealize result:', parsed);
-    renderIdealizePreview(parsed);
-    const mode = parsed.mode || 'actions';
-    const items = mode === 'rewrite' ? (parsed.messages || []) : (parsed.actions || []);
-    const count = items.length;
-    document.getElementById('idealize-desc').textContent =
-      mode === 'rewrite'
-        ? `Rewrite mode: ${count} messages generated. Review and apply.`
-        : `Actions mode: ${count} per-message actions. Review and apply.`;
-    document.getElementById('idealize-apply-btn').disabled = false;
-    setStatus('Idealization ready.');
-  } catch(e) {
-    if (window.runtime) window.runtime.EventsOff('claude:stream');
-    document.getElementById('idealize-desc').textContent = 'Error: ' + e;
-    setStatus('Idealize failed: ' + e);
-  }
-}
-
-function renderIdealizePreview(parsed) {
-  const container = document.getElementById('idealize-preview');
-  const mode = parsed.mode || 'actions';
-
-  if (mode === 'rewrite') {
-    // Rewrite mode: show new messages as chat bubbles
-    container.innerHTML = (parsed.messages || []).map(m => {
-      const roleClass = m.role === 'user' ? 'role-user' : 'role-assistant';
-      let contentHtml = '';
-      if (Array.isArray(m.content)) {
-        contentHtml = m.content.map(c => renderContentBlock(c)).join('');
-      } else if (typeof m.content === 'string') {
-        contentHtml = `<div class="msg-text">${escHtml(m.content.slice(0, 2000))}</div>`;
-      }
-      return `<div style="margin-bottom:6px"><div class="msg-card ${roleClass}" style="border-radius:6px;overflow:hidden"><div class="msg-header"><span class="role-badge">${m.role}</span></div><div class="msg-content">${contentHtml || '<span style="color:#484f58">—</span>'}</div></div></div>`;
-    }).join('');
-  } else {
-    // Actions mode: show per-message actions with color coding
-    const msgMap = {};
-    allMessages.forEach(m => { msgMap[m.uuid] = m; });
-    container.innerHTML = (parsed.actions || []).map(a => {
-      const orig = msgMap[a.uuid];
-      const role = orig ? orig.role : '?';
-      const roleClass = role === 'user' ? 'role-user' : 'role-assistant';
-      const actionColors = { delete: '#f85149', keep: '#3fb950', edit: '#d29922' };
-      const actionColor = actionColors[a.action] || '#8b949e';
-      // Extract text from original message raw content
-      let preview = '';
-      if (orig?.raw?.message?.content) {
-        const content = orig.raw.message.content;
-        if (Array.isArray(content)) {
-          preview = content.map(c => {
-            if (c.type === 'text') return c.text || '';
-            if (c.type === 'tool_use') return `[tool: ${c.name}]`;
-            if (c.type === 'tool_result') return typeof c.content === 'string' ? c.content : '[tool result]';
-            return '';
-          }).filter(Boolean).join('\n').slice(0, 500);
-        } else if (typeof content === 'string') {
-          preview = content.slice(0, 500);
-        }
-      }
-      if (!preview && orig?.content_summary?.text_preview) {
-        preview = orig.content_summary.text_preview.slice(0, 500);
-      }
-      let editedHtml = '';
-      if (a.action === 'edit' && a.edited_content) {
-        editedHtml = `<div style="margin-top:4px;padding:6px 8px;background:#1c2128;border-left:2px solid ${actionColor};font-size:12px;color:#e6edf3"><strong style="color:${actionColor}">Edited:</strong> ${escHtml(a.edited_content.slice(0, 500))}</div>`;
-      }
-      return `<div style="margin-bottom:4px;opacity:${a.action === 'delete' ? 0.5 : 1}">
-        <div class="msg-card ${roleClass}" style="border-radius:6px;overflow:hidden;border-left:3px solid ${actionColor}">
-          <div class="msg-header"><span class="role-badge">${role}</span><span style="margin-left:auto;font-size:11px;color:${actionColor};font-weight:600">${a.action.toUpperCase()}</span></div>
-          <div class="msg-content"><div class="msg-text" style="font-size:12px;color:#8b949e;white-space:pre-wrap">${escHtml(preview) || '—'}</div>${editedHtml}</div>
-        </div></div>`;
-    }).join('');
-  }
-}
-
-function hideIdealizeDialog(e) {
-  if (e && e.target !== document.getElementById('idealize-overlay')) return;
-  document.getElementById('idealize-overlay').classList.remove('show');
-}
-
 function generateUUID() {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
@@ -656,136 +531,7 @@ function generateUUID() {
   });
 }
 
-async function applyIdealized() {
-  const jsonStr = document.getElementById('idealize-ta').value.trim();
-  if (!jsonStr) return;
-  let parsed;
-  try { parsed = JSON.parse(jsonStr); } catch(e) { setStatus('Invalid JSON: ' + e); return; }
-  pushUndo();
-  hideIdealizeDialog();
 
-  const mode = parsed.mode || 'actions';
-
-  if (mode === 'rewrite') {
-    // Rewrite mode: replace selected messages with new ones
-    const firstSelIdx = allMessages.findIndex(m => pendingIdealizeUuids.includes(m.uuid));
-    const firstParentUuid = firstSelIdx > 0 ? allMessages[firstSelIdx - 1]?.uuid : null;
-
-    const newLines = [];
-    const newMsgObjects = [];
-    let prevUuid = firstParentUuid;
-    for (const im of parsed.messages) {
-      const uuid = generateUUID();
-      const content = typeof im.content === 'string' ? [{ type: 'text', text: im.content }] : im.content;
-      const rawLine = JSON.stringify({
-        uuid,
-        parentUuid: prevUuid,
-        type: im.role,
-        timestamp: new Date().toISOString(),
-        message: { role: im.role, content },
-        sessionId: currentSession,
-        isSidechain: false,
-      });
-      newLines.push(rawLine);
-      newMsgObjects.push({
-        uuid,
-        parentUuid: prevUuid,
-        role: im.role,
-        type: im.role,
-        timestamp: new Date().toISOString(),
-        isSidechain: false,
-        is_tool_only: false,
-        content_summary: { types: ['text'], text_preview: typeof im.content === 'string' ? im.content.slice(0, 100) : '', size: JSON.stringify(content).length },
-        raw: JSON.parse(rawLine),
-      });
-      prevUuid = uuid;
-    }
-
-    pendingInsertLines = newLines;
-    pendingDeletedUuids = [...pendingIdealizeUuids];
-
-    const selSet = new Set(pendingIdealizeUuids);
-    const firstIdx = allMessages.findIndex(m => selSet.has(m.uuid));
-    allMessages = allMessages.filter(m => !selSet.has(m.uuid));
-    allMessages.splice(firstIdx, 0, ...newMsgObjects);
-    pendingIdealizeUuids.forEach(u => deletedUuids.add(u));
-
-    setStatus(`Applied rewrite (${parsed.messages.length} messages). Click Save to write.`);
-  } else {
-    // Actions mode: apply per-message delete/keep/edit
-    const toDelete = [];
-    const toKeep = [];
-    const editLines = [];
-    for (const a of parsed.actions) {
-      if (a.action === 'delete') {
-        toDelete.push(a.uuid);
-      } else if (a.action === 'keep') {
-        toKeep.push(a.uuid);
-      } else if (a.action === 'edit' && a.edited_content) {
-        toKeep.push(a.uuid); // edited messages are kept
-        const msg = allMessages.find(m => m.uuid === a.uuid);
-        if (msg) {
-          const newContent = [{ type: 'text', text: a.edited_content }];
-          msg.raw.message = { role: msg.role, content: newContent };
-          msg.content_summary = { types: ['text'], text_preview: a.edited_content.slice(0, 100), size: a.edited_content.length };
-          const newRaw = { ...msg.raw };
-          newRaw.message = { role: msg.role, content: newContent };
-          editLines.push(JSON.stringify(newRaw));
-        }
-      }
-    }
-
-    // Keep/edit: remove from deletedUuids (unselect)
-    toKeep.forEach(u => deletedUuids.delete(u));
-    // Delete: ensure in deletedUuids
-    toDelete.forEach(u => deletedUuids.add(u));
-    pendingDeletedUuids = [...new Set([...(pendingDeletedUuids || []), ...toDelete])];
-    if (editLines.length > 0) {
-      pendingInsertLines = [...(pendingInsertLines || []), ...editLines];
-    }
-
-    const deleteCount = toDelete.length;
-    const editCount = parsed.actions.filter(a => a.action === 'edit').length;
-    const keepCount = parsed.actions.filter(a => a.action === 'keep').length;
-    setStatus(`Actions applied: ${deleteCount} deleted, ${editCount} edited, ${keepCount} kept. Click Save to write.`);
-  }
-
-  renderConversation();
-  updateButtons();
-}
-
-let pendingSummaryUuids = [];
-
-async function startSummarize() {
-  if (deletedUuids.size === 0) return;
-  pendingSummaryUuids = [...deletedUuids];
-  document.getElementById('summarize-desc').textContent =
-    `${pendingSummaryUuids.length} messages selected. Generating summary with Claude...`;
-  document.getElementById('summarize-ta').value = '';
-  document.getElementById('summarize-apply-btn').disabled = true;
-  document.getElementById('summarize-overlay').classList.add('show');
-  setStatus('Summarizing with Claude...');
-  try {
-    const summary = await inv('summarize_messages', {
-      project_id: currentProject,
-      session_id: currentSession,
-      uuids: pendingSummaryUuids,
-    });
-    document.getElementById('summarize-ta').value = summary;
-    document.getElementById('summarize-desc').textContent =
-      `${pendingSummaryUuids.length} messages will be replaced with this summary. You can edit before applying.`;
-    document.getElementById('summarize-apply-btn').disabled = false;
-    setStatus('Summary ready.');
-  } catch(e) {
-    document.getElementById('summarize-desc').textContent = 'Error: ' + e;
-    setStatus('Summarize failed: ' + e);
-  }
-}
-
-function hideSummarizeDialog(e) {
-  if (e && e.target !== document.getElementById('summarize-overlay')) return;
-  document.getElementById('summarize-overlay').classList.remove('show');
-}
 
 // --- Text-to-Image ---
 async function startT2i() {
@@ -837,26 +583,6 @@ function humanSize(bytes) {
   return (bytes/1024/1024).toFixed(1) + ' MB';
 }
 
-async function applySummary() {
-  const summary = document.getElementById('summarize-ta').value.trim();
-  if (!summary) return;
-  pushUndo();
-  hideSummarizeDialog();
-  setStatus('Applying summary...');
-  try {
-    await inv('apply_summary', {
-      project_id: currentProject,
-      session_id: currentSession,
-      uuids: pendingSummaryUuids,
-      summary,
-    });
-    deletedUuids = new Set();
-    setStatus('Summary applied. Reloading...');
-    await loadConversation(currentSession);
-  } catch(e) {
-    setStatus('Apply failed: ' + e);
-  }
-}
 
 async function branchFrom(index) {
   const msg = allMessages[index];
@@ -1043,8 +769,6 @@ function updateButtons() {
   const hasDeleted = deletedUuids.size > 0;
   document.getElementById('delete-btn').disabled = !hasDeleted;
   document.getElementById('save-btn').disabled = !hasDeleted;
-  document.getElementById('summarize-btn').disabled = !hasDeleted;
-  document.getElementById('idealize-btn').disabled = !hasDeleted;
 }
 
 function deleteSelected() {
@@ -1164,8 +888,6 @@ Object.assign(window, {
   loadProjects, loadSessions, setCurrentProject, setCurrentSession,
   selectAll, toggleTools, toggleSidechain, loadConversation, reloadConversation,
   showExecDialog, hideExecDialog, copyExecCommand, execClaude,
-  startIdealize, hideIdealizeDialog, applyIdealized,
-  startSummarize, hideSummarizeDialog, applySummary,
   startT2i, hideT2iDialog, applyT2i,
   showSaveDialog, hideSaveDialog, executeSave,
   hideInsertDialog, commitInsert,

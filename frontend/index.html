@@ -175,8 +175,6 @@
       <div class="spacer"></div>
       <button class="btn btn-default" onclick="showExecDialog()">▶ Launch</button>
       <button class="btn btn-default" onclick="startT2i()">🖼 Image</button>
-      <button class="btn btn-default" id="idealize-btn" onclick="startIdealize()" disabled>✨ Idealize</button>
-      <button class="btn btn-default" id="summarize-btn" onclick="startSummarize()" disabled>⚗ Summarize</button>
       <button class="btn btn-danger" id="delete-btn" onclick="deleteSelected()" disabled>Delete Selected</button>
       <button class="btn btn-success" id="save-btn" onclick="showSaveDialog()" disabled>Save</button>
     </div>
@@ -244,23 +242,6 @@
   </div>
 </div>
 
-<!-- Idealize dialog -->
-<div class="overlay" id="idealize-overlay" onclick="hideIdealizeDialog(event)">
-  <div class="dialog" style="min-width:600px;max-width:800px" onclick="event.stopPropagation()">
-    <h2>✨ Idealize</h2>
-    <p id="idealize-desc" style="margin-bottom:12px;font-size:13px;color:#8b949e"></p>
-    <div id="idealize-preview" style="max-height:400px;overflow-y:auto;margin-bottom:12px"></div>
-    <details style="margin-bottom:8px">
-      <summary style="font-size:11px;color:#484f58;cursor:pointer">Edit JSON</summary>
-      <textarea id="idealize-ta" class="edit-area" style="min-height:160px;font-size:11px;font-family:monospace;margin-top:6px"></textarea>
-    </details>
-    <div class="dialog-actions">
-      <button class="btn btn-default" onclick="hideIdealizeDialog()">Cancel</button>
-      <button class="btn btn-success" id="idealize-apply-btn" onclick="applyIdealized()" disabled>Apply</button>
-    </div>
-  </div>
-</div>
-
 <!-- Text-to-Image dialog -->
 <div class="overlay" id="t2i-overlay" onclick="hideT2iDialog(event)">
   <div class="dialog" style="min-width:80vw;max-width:95vw;max-height:90vh;display:flex;flex-direction:column" onclick="event.stopPropagation()">
@@ -274,18 +255,6 @@
   </div>
 </div>
 
-<!-- Summarize dialog -->
-<div class="overlay" id="summarize-overlay" onclick="hideSummarizeDialog(event)">
-  <div class="dialog" style="min-width:520px;max-width:700px" onclick="event.stopPropagation()">
-    <h2>⚗ Summarize</h2>
-    <p id="summarize-desc" style="margin-bottom:12px"></p>
-    <textarea id="summarize-ta" class="edit-area" style="min-height:200px"></textarea>
-    <div class="dialog-actions">
-      <button class="btn btn-default" onclick="hideSummarizeDialog()">Cancel</button>
-      <button class="btn btn-success" id="summarize-apply-btn" onclick="applySummary()">Apply</button>
-    </div>
-  </div>
-</div>
 
 </body>
 </html>

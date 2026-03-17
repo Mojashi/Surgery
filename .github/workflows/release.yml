@@ -28,6 +28,9 @@ jobs:
       - name: Install frontend deps
         run: cd frontend && npm install
 
+      - name: Compile Swift helper
+        run: swiftc scripts/html2png.swift -o scripts/html2png -framework WebKit -framework Cocoa -O
+
       - name: Build
         run: wails build -platform darwin/arm64 -ldflags "-X main.Version=${GITHUB_REF_NAME#v}"
 

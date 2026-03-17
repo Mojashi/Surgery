@@ -36,8 +36,8 @@ func main() {
 	case len(args) >= 1 && args[0] == "update":
 		runUpdate()
 
-	case len(args) >= 1 && args[0] == "compact":
-		runCompactCLI(args[1:])
+	case len(args) >= 1 && args[0] == "view":
+		runViewCLI(args[1:])
 
 	case len(args) >= 1 && args[0] == "--open":
 		// Open Wails window, optionally with a specific session
@@ -70,14 +70,8 @@ func main() {
 		runNotifyWindow(title, string(msg))
 
 	default:
-		if os.Getenv("CLAUDECODE") == "1" {
-			// Inside Claude Code: token-based session detection
-			runSurgery()
-		} else {
-			// Standalone: open GUI directly (auto-detect project from cwd)
-			projectID := deriveProjectID()
-			runGUI(projectID, "")
-		}
+		// Default command: compact (text-to-image)
+		runCompactCLI(args)
 	}
 }
 
@@ -110,8 +104,13 @@ func spawnBackground(command string, extraArgs ...string) {
 	os.Exit(0)
 }
 
-func runSurgery() {
-	spawnBackground("open")
+func runViewCLI(args []string) {
+	if os.Getenv("CLAUDECODE") == "1" {
+		spawnBackground("open")
+	} else {
+		projectID := deriveProjectID()
+		runGUI(projectID, "")
+	}
 }
 
 // runBg is the unified background handler.
@@ -586,10 +585,6 @@ func (c *CompactApp) RunCompact() map[string]string {
 	toRender := conv.Entries[:splitIdx]
 	toKeep := conv.Entries[splitIdx:]
 
-	// Build preview HTML
-	emit("Building HTML preview...")
-	previewHTML := buildChatHTML(toRender)
-
 	// Render images in parallel chunks (50 entries per chunk)
 	emit("Rendering images (0%)...")
 	pngPages, err := renderHTMLChunksParallel(toRender, 50, func(done, total int) {
@@ -609,7 +604,7 @@ func (c *CompactApp) RunCompact() map[string]string {
 			"type": "image",
 			"source": map[string]string{
 				"type":       "base64",
-				"media_type": "image/png",
+				"media_type": detectImageMediaType(pngData),
 				"data":       base64.StdEncoding.EncodeToString(pngData),
 			},
 		})
@@ -652,12 +647,23 @@ func (c *CompactApp) RunCompact() map[string]string {
 		return map[string]string{"error": fmt.Sprintf("write error: %v", err)}
 	}
 
-	reportText := fmt.Sprintf("%d entries → %d entries, %d page images",
-		beforeCount, len(result), len(pngPages))
+	afterTokens := estimateEntryTokens(result)
+	reportText := fmt.Sprintf("%d entries → %d entries, %d page images\n~%d tokens",
+		beforeCount, len(result), len(pngPages), afterTokens)
+
+	// Build preview HTML showing all rendered page images
+	var previewBuf strings.Builder
+	previewBuf.WriteString(`<!DOCTYPE html><html><head><style>body{margin:0;padding:8px;background:#1a1a1a;display:flex;flex-direction:column;gap:4px;}img{width:100%;display:block;border-radius:4px;}</style></head><body>`)
+	for _, pngData := range pngPages {
+		mt := detectImageMediaType(pngData)
+		b64 := base64.StdEncoding.EncodeToString(pngData)
+		previewBuf.WriteString(fmt.Sprintf(`<img src="data:%s;base64,%s">`, mt, b64))
+	}
+	previewBuf.WriteString(`</body></html>`)
 
 	return map[string]string{
 		"session_id":   newID,
-		"html":         previewHTML,
+		"html":         previewBuf.String(),
 		"report":       reportText,
 		"resume_cmd":   "claude --resume " + newID,
 		"resume_slash": "/resume " + newID,
