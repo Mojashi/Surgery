@@ -46,6 +46,7 @@ func AllRules() []CompactRule {
 		&TruncateOldReadsRule{},
 		&TruncateOldWritesRule{},
 		&ShortenSuccessResultsRule{},
+		&ShortenPathsRule{},
 		&FixNullContentRule{},
 	}
 }
@@ -946,6 +947,153 @@ func (r *ShortenSuccessResultsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry,
 	report.BytesSaved = report.BytesBefore - report.BytesAfter
 	if shortened > 0 {
 		report.Details = append(report.Details, fmt.Sprintf("shortened %d success messages", shortened))
+	}
+	return entries, report
+}
+
+// --- Rule: ShortenPathsRule ---
+// Replaces the project root prefix in tool_use inputs and tool_result contents
+// with "./" to save tokens. Only modifies tool blocks, not assistant text.
+
+type ShortenPathsRule struct{}
+
+func (r *ShortenPathsRule) Name() string { return "shorten-paths" }
+func (r *ShortenPathsRule) Description() string {
+	return "Shorten project root paths to ./ in tool blocks"
+}
+
+func (r *ShortenPathsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleReport) {
+	report := CompactRuleReport{BytesBefore: entriesSize(entries)}
+
+	// Detect project root: find the most common path prefix in Read/Write/Edit inputs
+	pathCounts := map[string]int{}
+	for _, e := range entries {
+		if e.Message == nil || e.Type != "assistant" {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(e.Message.Content, &blocks) != nil {
+			continue
+		}
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			var typ string
+			json.Unmarshal(b["type"], &typ)
+			if typ == "tool_use" {
+				var input struct {
+					FilePath string `json:"file_path"`
+				}
+				json.Unmarshal(b["input"], &input)
+				if input.FilePath != "" {
+					// Extract directory
+					dir := input.FilePath
+					for i := len(dir) - 1; i >= 0; i-- {
+						if dir[i] == '/' {
+							dir = dir[:i+1]
+							break
+						}
+					}
+					pathCounts[dir]++
+				}
+			}
+		}
+	}
+
+	// Find the longest common prefix that appears in >50% of paths
+	var projectRoot string
+	maxCount := 0
+	for dir, count := range pathCounts {
+		if count > maxCount || (count == maxCount && len(dir) > len(projectRoot)) {
+			projectRoot = dir
+			maxCount = count
+		}
+	}
+
+	if projectRoot == "" || len(projectRoot) < 10 {
+		report.BytesAfter = report.BytesBefore
+		return entries, report
+	}
+
+	// Find the actual common prefix among all paths that start with projectRoot
+	// Walk up until we find a prefix used by most paths
+	for {
+		matchCount := 0
+		for dir, count := range pathCounts {
+			if strings.HasPrefix(dir, projectRoot) {
+				matchCount += count
+			}
+		}
+		if matchCount > maxCount/2 {
+			break
+		}
+		// Go up one level
+		idx := strings.LastIndex(projectRoot[:len(projectRoot)-1], "/")
+		if idx < 0 {
+			break
+		}
+		projectRoot = projectRoot[:idx+1]
+	}
+
+	shortened := 0
+
+	// Replace in tool_use inputs and tool_result contents
+	for _, e := range entries {
+		if e.Message == nil {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(e.Message.Content, &blocks) != nil {
+			continue
+		}
+
+		modified := false
+		for i, block := range blocks {
+			raw := string(block)
+			if !strings.Contains(raw, projectRoot) {
+				continue
+			}
+
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			var typ string
+			json.Unmarshal(b["type"], &typ)
+
+			if typ == "tool_use" {
+				inputRaw := string(b["input"])
+				newInput := strings.ReplaceAll(inputRaw, projectRoot, "./")
+				if newInput != inputRaw {
+					b["input"] = json.RawMessage(newInput)
+					blocks[i], _ = json.Marshal(b)
+					modified = true
+					shortened++
+				}
+			} else if typ == "tool_result" {
+				contentRaw := string(b["content"])
+				newContent := strings.ReplaceAll(contentRaw, projectRoot, "./")
+				if newContent != contentRaw {
+					b["content"] = json.RawMessage(newContent)
+					blocks[i], _ = json.Marshal(b)
+					modified = true
+					shortened++
+				}
+			}
+		}
+
+		if modified {
+			e.Message.Content, _ = json.Marshal(blocks)
+		}
+	}
+
+	report.BytesAfter = entriesSize(entries)
+	report.BytesSaved = report.BytesBefore - report.BytesAfter
+	if shortened > 0 {
+		report.Details = append(report.Details,
+			fmt.Sprintf("shortened %d path references (root: %s)", shortened, projectRoot))
 	}
 	return entries, report
 }
