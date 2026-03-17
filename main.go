@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 //go:embed all:frontend/dist
@@ -559,42 +562,103 @@ type CompactApp struct {
 func (c *CompactApp) startup(ctx context.Context) { c.ctx = ctx }
 
 // RunCompact is called from the frontend after the window is already visible.
-// It runs the full compact pipeline and returns the result.
+// It runs the full compact pipeline with parallel rendering and progress events.
 func (c *CompactApp) RunCompact() map[string]string {
 	if c.jsonlPath == "" {
 		return map[string]string{"error": "no session file"}
 	}
 
+	emit := func(msg string) {
+		wailsRuntime.EventsEmit(c.ctx, "compact-progress", msg)
+	}
+
+	emit("Loading session...")
 	conv, err := LoadConversation(c.jsonlPath)
 	if err != nil {
 		return map[string]string{"error": fmt.Sprintf("load error: %v", err)}
 	}
 	beforeCount := conv.EntryCount()
 
-	// Build preview HTML before compaction
 	splitIdx := findImageBoundary(conv.Entries)
-	previewHTML := ""
-	if splitIdx >= 2 {
-		previewHTML = buildChatHTML(conv.Entries[:splitIdx])
+	if splitIdx < 2 {
+		return map[string]string{"error": "not enough entries to convert"}
+	}
+	toRender := conv.Entries[:splitIdx]
+	toKeep := conv.Entries[splitIdx:]
+
+	// Build preview HTML
+	emit("Building HTML preview...")
+	previewHTML := buildChatHTML(toRender)
+
+	// Render images in parallel chunks (50 entries per chunk)
+	emit("Rendering images (0%)...")
+	pngPages, err := renderHTMLChunksParallel(toRender, 50, func(done, total int) {
+		pct := done * 100 / total
+		emit(fmt.Sprintf("Rendering images (%d%%, %d/%d chunks)...", pct, done, total))
+	})
+	if err != nil {
+		return map[string]string{"error": fmt.Sprintf("render error: %v", err)}
 	}
 
-	// Run compaction
-	rules := selectRules([]string{"text-to-image"})
-	report := RunCompaction(conv, rules)
+	emit("Building output...")
+
+	// Build image content blocks
+	var imgBlocks []any
+	for _, pngData := range pngPages {
+		imgBlocks = append(imgBlocks, map[string]any{
+			"type": "image",
+			"source": map[string]string{
+				"type":       "base64",
+				"media_type": "image/png",
+				"data":       base64.StdEncoding.EncodeToString(pngData),
+			},
+		})
+	}
+	imgBlocks = append(imgBlocks, map[string]string{
+		"type": "text",
+		"text": fmt.Sprintf("[conversation history rendered as %d page image(s)]", len(pngPages)),
+	})
+	imgContent, _ := json.Marshal(imgBlocks)
+
+	sessionID := ""
+	if len(toKeep) > 0 {
+		sessionID = toKeep[0].SessionID
+	} else if len(toRender) > 0 {
+		sessionID = toRender[0].SessionID
+	}
+
+	imgEntry := NewEntry(generateUUID(), "", "user", sessionID, NewMessageContentBlocks("user", imgContent))
+
+	var result []*JSONLEntry
+	result = append(result, imgEntry)
+	for i, e := range toKeep {
+		if i == 0 && e.UUID != "" {
+			e.SetParentUUID(imgEntry.UUID)
+		}
+		result = append(result, e)
+	}
+
+	// Build report
+	report := CompactReport{TotalBefore: entriesSize(conv.Entries), TotalAfter: entriesSize(result)}
+	report.TotalSaved = report.TotalBefore - report.TotalAfter
+
+	emit("Writing session...")
 
 	// Write new session
+	newConv := &Conversation{Entries: result}
 	newID := generateUUID()
-	conv.SessionID = newID
-	for _, e := range conv.Entries {
+	newConv.SessionID = newID
+	for _, e := range newConv.Entries {
 		e.SessionID = newID
 	}
 	dir := filepath.Dir(c.jsonlPath)
-	if err := conv.WriteToFile(filepath.Join(dir, newID+".jsonl")); err != nil {
+	if err := newConv.WriteToFile(filepath.Join(dir, newID+".jsonl")); err != nil {
 		return map[string]string{"error": fmt.Sprintf("write error: %v", err)}
 	}
 
 	var sb strings.Builder
-	formatCompactReport(&sb, filepath.Base(c.jsonlPath), beforeCount, conv.EntryCount(), report)
+	formatCompactReport(&sb, filepath.Base(c.jsonlPath), beforeCount, len(result), report)
+	sb.WriteString(fmt.Sprintf("\n%d entries → %d entries, %d page images", len(conv.Entries), len(result), len(pngPages)))
 
 	return map[string]string{
 		"session_id":   newID,

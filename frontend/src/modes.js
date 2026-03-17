@@ -22,6 +22,7 @@ function modeShell() {
 
 export async function initCompactMode() {
   const app = window.go.main.CompactApp;
+  const runtime = window.runtime; // Wails runtime (injected)
   modeShell();
 
   const title = document.createElement('h2');
@@ -30,13 +31,20 @@ export async function initCompactMode() {
   document.body.appendChild(title);
 
   const status = document.createElement('p');
-  status.textContent = 'Rendering conversation as images...';
+  status.textContent = 'Starting...';
   status.style.cssText = 'color:#8b949e;font-size:13px;margin-bottom:12px;flex-shrink:0;';
   document.body.appendChild(status);
 
   const contentDiv = document.createElement('div');
   contentDiv.style.cssText = 'flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0;';
   document.body.appendChild(contentDiv);
+
+  // Listen for progress events from Go
+  if (runtime?.EventsOn) {
+    runtime.EventsOn('compact-progress', (msg) => {
+      status.textContent = msg;
+    });
+  }
 
   const data = await app.RunCompact();
   if (data.error) {
@@ -45,6 +53,7 @@ export async function initCompactMode() {
     return;
   }
   status.textContent = 'Done!';
+  status.style.color = '#3fb950';
 
   // Resume commands
   const cmdsDiv = document.createElement('div');

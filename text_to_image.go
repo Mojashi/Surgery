@@ -10,6 +10,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 // --- Rule: TextToImageRule ---
@@ -135,10 +137,9 @@ func findImageBoundary(entries []*JSONLEntry) int {
 	return lastAssistant
 }
 
-// buildChatHTML renders conversation entries as a chat-style HTML document.
-func buildChatHTML(entries []*JSONLEntry) string {
+// buildChatSections renders entries to HTML section strings (one per entry).
+func buildChatSections(entries []*JSONLEntry) string {
 	var sections strings.Builder
-
 	for _, e := range entries {
 		if e.Message == nil {
 			continue
@@ -150,7 +151,6 @@ func buildChatHTML(entries []*JSONLEntry) string {
 
 		var blocks []json.RawMessage
 		if json.Unmarshal(e.Message.Content, &blocks) != nil {
-			// Try as plain string
 			var s string
 			if json.Unmarshal(e.Message.Content, &s) == nil && s != "" {
 				sections.WriteString(renderChatBubble(role, html.EscapeString(s)))
@@ -173,20 +173,15 @@ func buildChatHTML(entries []*JSONLEntry) string {
 				if text != "" {
 					sections.WriteString(renderChatBubble(role, html.EscapeString(text)))
 				}
-
 			case "tool_use":
 				var name string
 				json.Unmarshal(b["name"], &name)
 				var input map[string]any
 				json.Unmarshal(b["input"], &input)
-				// Compact representation
-				summary := formatToolUse(name, input)
-				sections.WriteString(renderToolBlock("tool_use", summary))
-
+				sections.WriteString(renderToolBlock("tool_use", formatToolUse(name, input)))
 			case "tool_result":
 				text := extractToolResultText(b["content"])
 				if text != "" {
-					// Truncate very long results for rendering
 					if len(text) > 3000 {
 						text = text[:3000] + "\n... (truncated)"
 					}
@@ -195,13 +190,10 @@ func buildChatHTML(entries []*JSONLEntry) string {
 			}
 		}
 	}
+	return sections.String()
+}
 
-	return fmt.Sprintf(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-@page {
+const chatHTMLStyle = `@page {
   size: 1200px 900px;
   margin: 0;
 }
@@ -248,13 +240,130 @@ body {
   white-space: pre-wrap;
   word-wrap: break-word;
   color: #333;
+}`
+
+func wrapChatHTML(body string) string {
+	return fmt.Sprintf(`<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>%s</style></head>
+<body>%s</body></html>`, chatHTMLStyle, body)
 }
-</style>
-</head>
-<body>
-%s
-</body>
-</html>`, sections.String())
+
+// buildChatHTML renders conversation entries as a chat-style HTML document.
+func buildChatHTML(entries []*JSONLEntry) string {
+	return wrapChatHTML(buildChatSections(entries))
+}
+
+// renderHTMLChunksParallel splits entries into chunks, renders each in parallel.
+// progressFn is called after each chunk completes: progressFn(completed, total).
+func renderHTMLChunksParallel(entries []*JSONLEntry, chunkSize int, progressFn func(int, int)) ([][]byte, error) {
+	// Split entries into chunks
+	var chunks [][]*JSONLEntry
+	for i := 0; i < len(entries); i += chunkSize {
+		end := i + chunkSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		chunks = append(chunks, entries[i:end])
+	}
+	if len(chunks) == 0 {
+		return nil, fmt.Errorf("no entries to render")
+	}
+
+	// Render each chunk's HTML
+	htmlDocs := make([]string, len(chunks))
+	for i, chunk := range chunks {
+		htmlDocs[i] = wrapChatHTML(buildChatSections(chunk))
+	}
+
+	// Render all chunks in parallel
+	type chunkResult struct {
+		index int
+		pages [][]byte
+		err   error
+	}
+	results := make([]chunkResult, len(htmlDocs))
+	var wg sync.WaitGroup
+	completed := 0
+	var mu sync.Mutex
+
+	for i, doc := range htmlDocs {
+		wg.Add(1)
+		go func(idx int, html string) {
+			defer wg.Done()
+			start := time.Now()
+			pages, err := renderHTMLToImages(html)
+			fmt.Fprintf(os.Stderr, "  chunk %d: %v (%d pages)\n", idx, time.Since(start).Round(time.Millisecond), len(pages))
+			results[idx] = chunkResult{index: idx, pages: pages, err: err}
+			mu.Lock()
+			completed++
+			if progressFn != nil {
+				progressFn(completed, len(htmlDocs))
+			}
+			mu.Unlock()
+		}(i, doc)
+	}
+	wg.Wait()
+
+	// Collect all pages in order
+	var allPages [][]byte
+	for _, r := range results {
+		if r.err != nil {
+			return nil, fmt.Errorf("chunk %d: %w", r.index, r.err)
+		}
+		allPages = append(allPages, r.pages...)
+	}
+	return allPages, nil
+}
+
+// renderHTMLToImages renders a single HTML to PNG images.
+func renderHTMLToImages(htmlContent string) ([][]byte, error) {
+	tmpDir, err := os.MkdirTemp("", "surgery-img-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	htmlPath := filepath.Join(tmpDir, "input.html")
+	pdfPath := filepath.Join(tmpDir, "output.pdf")
+	pngPattern := filepath.Join(tmpDir, "output.png")
+
+	if err := os.WriteFile(htmlPath, []byte(htmlContent), 0644); err != nil {
+		return nil, err
+	}
+
+	// weasyprint HTML → PDF
+	cmd := exec.Command("weasyprint", htmlPath, pdfPath, "--presentational-hints")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("weasyprint: %v: %s", err, stderr.String())
+	}
+
+	// magick PDF → PNG per page, trimmed
+	cmd = exec.Command("magick", "-density", "144", pdfPath, "-trim", "+repage", pngPattern)
+	stderr.Reset()
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("magick: %v: %s", err, stderr.String())
+	}
+
+	// Collect pages
+	var pages [][]byte
+	if data, err := os.ReadFile(pngPattern); err == nil {
+		pages = append(pages, data)
+	} else {
+		for i := 0; ; i++ {
+			data, err := os.ReadFile(filepath.Join(tmpDir, fmt.Sprintf("output-%d.png", i)))
+			if err != nil {
+				break
+			}
+			pages = append(pages, data)
+		}
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("no PNG output generated")
+	}
+	return pages, nil
 }
 
 func renderChatBubble(role, content string) string {
@@ -304,54 +413,4 @@ func formatToolUse(name string, input map[string]any) string {
 	}
 }
 
-// renderHTMLToImages renders HTML to PNG images (one per page) via weasyprint + magick.
-func renderHTMLToImages(htmlContent string) ([][]byte, error) {
-	tmpDir, err := os.MkdirTemp("", "surgery-img-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmpDir)
-
-	htmlPath := filepath.Join(tmpDir, "input.html")
-	pdfPath := filepath.Join(tmpDir, "output.pdf")
-	pngPattern := filepath.Join(tmpDir, "output.png")
-
-	if err := os.WriteFile(htmlPath, []byte(htmlContent), 0644); err != nil {
-		return nil, err
-	}
-
-	// weasyprint HTML → PDF
-	cmd := exec.Command("weasyprint", htmlPath, pdfPath, "--presentational-hints")
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("weasyprint: %v: %s", err, stderr.String())
-	}
-
-	// magick PDF → PNG per page, trimmed
-	cmd = exec.Command("magick", "-density", "144", pdfPath, "-trim", "+repage", pngPattern)
-	stderr.Reset()
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("magick: %v: %s", err, stderr.String())
-	}
-
-	// Collect pages: single → output.png, multi → output-0.png, output-1.png, ...
-	var pages [][]byte
-	if data, err := os.ReadFile(pngPattern); err == nil {
-		pages = append(pages, data)
-	} else {
-		for i := 0; ; i++ {
-			data, err := os.ReadFile(filepath.Join(tmpDir, fmt.Sprintf("output-%d.png", i)))
-			if err != nil {
-				break
-			}
-			pages = append(pages, data)
-		}
-	}
-	if len(pages) == 0 {
-		return nil, fmt.Errorf("no PNG output generated")
-	}
-	return pages, nil
-}
 
