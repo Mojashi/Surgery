@@ -638,10 +638,6 @@ func (c *CompactApp) RunCompact() map[string]string {
 		result = append(result, e)
 	}
 
-	// Build report
-	report := CompactReport{TotalBefore: entriesSize(conv.Entries), TotalAfter: entriesSize(result)}
-	report.TotalSaved = report.TotalBefore - report.TotalAfter
-
 	emit("Writing session...")
 
 	// Write new session
@@ -656,14 +652,13 @@ func (c *CompactApp) RunCompact() map[string]string {
 		return map[string]string{"error": fmt.Sprintf("write error: %v", err)}
 	}
 
-	var sb strings.Builder
-	formatCompactReport(&sb, filepath.Base(c.jsonlPath), beforeCount, len(result), report)
-	sb.WriteString(fmt.Sprintf("\n%d entries → %d entries, %d page images", len(conv.Entries), len(result), len(pngPages)))
+	reportText := fmt.Sprintf("%d entries → %d entries, %d page images",
+		beforeCount, len(result), len(pngPages))
 
 	return map[string]string{
 		"session_id":   newID,
 		"html":         previewHTML,
-		"report":       sb.String(),
+		"report":       reportText,
 		"resume_cmd":   "claude --resume " + newID,
 		"resume_slash": "/resume " + newID,
 	}
