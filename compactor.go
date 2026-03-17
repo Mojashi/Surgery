@@ -45,6 +45,7 @@ func AllRules() []CompactRule {
 		&StripToolUseResultRule{},
 		&TruncateOldReadsRule{},
 		&TruncateOldWritesRule{},
+		&ShortenSuccessResultsRule{},
 		&FixNullContentRule{},
 	}
 }
@@ -868,6 +869,83 @@ func (r *TruncateOldWritesRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Com
 	report.BytesSaved = report.BytesBefore - report.BytesAfter
 	if truncated > 0 {
 		report.Details = append(report.Details, fmt.Sprintf("truncated %d old Write/Edit inputs", truncated))
+	}
+	return entries, report
+}
+
+// --- Rule: ShortenSuccessResultsRule ---
+// Shortens verbose success tool_result messages to just "success".
+// e.g. "The file /long/path/to/file.ts has been updated successfully." → "success"
+
+type ShortenSuccessResultsRule struct{}
+
+func (r *ShortenSuccessResultsRule) Name() string { return "shorten-success-results" }
+func (r *ShortenSuccessResultsRule) Description() string {
+	return "Shorten verbose success tool_result messages"
+}
+
+func (r *ShortenSuccessResultsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleReport) {
+	report := CompactRuleReport{BytesBefore: entriesSize(entries)}
+	shortened := 0
+
+	for _, e := range entries {
+		if e.Message == nil || e.Type != "user" {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(e.Message.Content, &blocks) != nil {
+			continue
+		}
+
+		modified := false
+		for i, block := range blocks {
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			var typ string
+			json.Unmarshal(b["type"], &typ)
+			if typ != "tool_result" {
+				continue
+			}
+
+			// Check if error
+			var isErr bool
+			if errField, ok := b["is_error"]; ok {
+				json.Unmarshal(errField, &isErr)
+			}
+			if isErr {
+				continue
+			}
+
+			// Get content as string
+			var content string
+			if json.Unmarshal(b["content"], &content) != nil {
+				continue
+			}
+
+			// Match success patterns
+			if strings.Contains(content, "successfully") ||
+				strings.Contains(content, "has been updated") ||
+				strings.Contains(content, "File created") {
+				if len(content) > 20 {
+					b["content"], _ = json.Marshal("success")
+					blocks[i], _ = json.Marshal(b)
+					modified = true
+					shortened++
+				}
+			}
+		}
+
+		if modified {
+			e.Message.Content, _ = json.Marshal(blocks)
+		}
+	}
+
+	report.BytesAfter = entriesSize(entries)
+	report.BytesSaved = report.BytesBefore - report.BytesAfter
+	if shortened > 0 {
+		report.Details = append(report.Details, fmt.Sprintf("shortened %d success messages", shortened))
 	}
 	return entries, report
 }
