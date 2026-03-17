@@ -41,8 +41,6 @@ type CompactRuleResult struct {
 // AllRules returns all available compaction rules in recommended order.
 func AllRules() []CompactRule {
 	return []CompactRule{
-		&StripProgressRule{},
-		&StripToolUseResultRule{},
 		&TruncateOldReadsRule{},
 		&TruncateOldWritesRule{},
 		&ShortenSuccessResultsRule{},
@@ -221,8 +219,7 @@ func (r *StripCwdRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleR
 
 // --- Rule: TruncateOldReadsRule ---
 // For each file, keeps only the LAST Read's full content.
-// Earlier Reads of the same file are replaced with a short placeholder.
-// This is the biggest context savings — Read results are ~19% of API requests.
+// Earlier Reads are replaced with a short placeholder.
 
 type TruncateOldReadsRule struct{}
 
@@ -268,8 +265,7 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 		}
 	}
 
-	// Pass 2: find the LAST Read tool_result per file (by file order)
-	// We scan forward and track the latest tool_use_id per file
+	// Pass 2: find the LAST Read tool_result per file
 	lastReadID := map[string]string{} // file_path → last tool_use_id
 	for _, e := range entries {
 		if e.Message == nil || e.Type != "user" {
@@ -317,13 +313,10 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 				continue
 			}
 			json.Unmarshal(b["tool_use_id"], &toolUseID)
-
 			filePath, isRead := readToolUses[toolUseID]
 			if !isRead {
 				continue
 			}
-
-			// Skip errors
 			var isErr bool
 			if errField, ok := b["is_error"]; ok {
 				json.Unmarshal(errField, &isErr)
@@ -331,15 +324,11 @@ func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Comp
 			if isErr {
 				continue
 			}
-
-			// Is this the last Read of this file?
 			if lastReadID[filePath] == toolUseID {
-				continue // keep full content
+				continue // keep the last Read
 			}
 
-			// Truncate: measure original, replace with placeholder
-			origContent := b["content"]
-			origSize := len(origContent)
+			origSize := len(b["content"])
 			shortName := filePath
 			if idx := strings.LastIndex(filePath, "/"); idx >= 0 {
 				shortName = filePath[idx+1:]
