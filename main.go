@@ -348,59 +348,21 @@ func cliUpdate(downloadURL, newVersion string) error {
 }
 
 func runCompactCLI(args []string) {
-	dryRun := false
-	var sessionID string
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--dry-run":
-			dryRun = true
-		case "--help", "-h":
-			fmt.Fprintln(os.Stderr, "Usage: surgery compact [session-id] [--dry-run]")
+	for _, a := range args {
+		if a == "--help" || a == "-h" {
+			fmt.Fprintln(os.Stderr, "Usage: !surgery compact")
 			fmt.Fprintln(os.Stderr, "  Renders conversation history as images for token efficiency.")
-			fmt.Fprintln(os.Stderr, "  Without --dry-run, opens GUI for preview and apply.")
+			fmt.Fprintln(os.Stderr, "  Must be run inside Claude Code.")
 			os.Exit(0)
-		default:
-			if !strings.HasPrefix(args[i], "-") && sessionID == "" {
-				sessionID = args[i]
-			}
 		}
 	}
 
-	// Inside Claude Code: use token-based session detection
-	if os.Getenv("CLAUDECODE") == "1" {
-		spawnBackground("compact")
-		return
+	if os.Getenv("CLAUDECODE") != "1" {
+		fmt.Fprintln(os.Stderr, "Error: surgery compact must be run inside Claude Code (!surgery compact)")
+		os.Exit(1)
 	}
 
-	ruleNames := []string{"text-to-image"}
-
-	// Find session
-	var jsonlPath string
-	if sessionID != "" {
-		projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
-		jsonlPath = findSessionByID(projectsBase, sessionID)
-		if jsonlPath == "" {
-			fmt.Fprintln(os.Stderr, "Error: session not found:", sessionID)
-			os.Exit(1)
-		}
-	} else {
-		projectID := deriveProjectID()
-		projectDir := filepath.Join(os.Getenv("HOME"), ".claude", "projects", projectID)
-		jsonlPath = mostRecentJSONL(projectDir)
-		if jsonlPath == "" {
-			fmt.Fprintln(os.Stderr, "Error: no session found for current directory.")
-			os.Exit(1)
-		}
-	}
-
-	if dryRun {
-		runCompactOnFile(jsonlPath, ruleNames, true)
-		return
-	}
-
-	// Open compact dialog (processes inside the window)
-	runCompactWindow(jsonlPath)
+	spawnBackground("compact")
 }
 
 // runCompactBackground is the background process spawned by "compact" under Claude Code.
