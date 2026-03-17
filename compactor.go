@@ -43,7 +43,7 @@ func AllRules() []CompactRule {
 	return []CompactRule{
 		&StripProgressRule{},
 		&StripToolUseResultRule{},
-		&DeduplicateReadRule{},
+		&TruncateOldReadsRule{},
 		&FixNullContentRule{},
 	}
 }
@@ -216,29 +216,26 @@ func (r *StripCwdRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleR
 	return entries, report
 }
 
-// --- Rule: DeduplicateReadRule ---
-// Replaces duplicate Read tool_result content with a reference to the first occurrence.
+// --- Rule: TruncateOldReadsRule ---
+// For each file, keeps only the LAST Read's full content.
+// Earlier Reads of the same file are replaced with a short placeholder.
+// This is the biggest context savings — Read results are ~19% of API requests.
 
-type DeduplicateReadRule struct{}
+type TruncateOldReadsRule struct{}
 
-func (r *DeduplicateReadRule) Name() string        { return "deduplicate-read" }
-func (r *DeduplicateReadRule) Description() string {
-	return "Replace duplicate file Read results with back-references"
+func (r *TruncateOldReadsRule) Name() string { return "truncate-old-reads" }
+func (r *TruncateOldReadsRule) Description() string {
+	return "Truncate non-last Read results per file"
 }
 
-func (r *DeduplicateReadRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleReport) {
+func (r *TruncateOldReadsRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRuleReport) {
 	report := CompactRuleReport{BytesBefore: entriesSize(entries)}
-	deduped := 0
-	var savedBytes int64
+	truncated := 0
 
-	// First pass: collect tool_use IDs → tool name + input
-	type toolInfo struct {
-		name     string
-		filePath string
-	}
-	toolUseMap := map[string]toolInfo{} // tool_use_id → info
+	// Pass 1: collect all Read tool_use IDs → file_path
+	readToolUses := map[string]string{} // tool_use_id → file_path
 	for _, e := range entries {
-		if e.Message == nil {
+		if e.Message == nil || e.Type != "assistant" {
 			continue
 		}
 		var blocks []json.RawMessage
@@ -250,10 +247,9 @@ func (r *DeduplicateReadRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Compa
 			if json.Unmarshal(block, &b) != nil {
 				continue
 			}
-			var typ string
+			var typ, id, name string
 			json.Unmarshal(b["type"], &typ)
 			if typ == "tool_use" {
-				var id, name string
 				json.Unmarshal(b["id"], &id)
 				json.Unmarshal(b["name"], &name)
 				if name == "Read" {
@@ -261,20 +257,42 @@ func (r *DeduplicateReadRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Compa
 						FilePath string `json:"file_path"`
 					}
 					json.Unmarshal(b["input"], &input)
-					toolUseMap[id] = toolInfo{name: name, filePath: input.FilePath}
+					if input.FilePath != "" {
+						readToolUses[id] = input.FilePath
+					}
 				}
 			}
 		}
 	}
 
-	// Second pass: track seen Read results by (file_path, content_hash)
-	// and replace duplicates
-	type readKey struct {
-		filePath    string
-		contentHash string
+	// Pass 2: find the LAST Read tool_result per file (by file order)
+	// We scan forward and track the latest tool_use_id per file
+	lastReadID := map[string]string{} // file_path → last tool_use_id
+	for _, e := range entries {
+		if e.Message == nil || e.Type != "user" {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(e.Message.Content, &blocks) != nil {
+			continue
+		}
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			var typ, toolUseID string
+			json.Unmarshal(b["type"], &typ)
+			if typ == "tool_result" {
+				json.Unmarshal(b["tool_use_id"], &toolUseID)
+				if fp, ok := readToolUses[toolUseID]; ok {
+					lastReadID[fp] = toolUseID
+				}
+			}
+		}
 	}
-	firstSeen := map[readKey]string{} // key → first message UUID
 
+	// Pass 3: truncate all non-last Read results
 	for _, e := range entries {
 		if e.Message == nil || e.Type != "user" {
 			continue
@@ -290,19 +308,19 @@ func (r *DeduplicateReadRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Compa
 			if json.Unmarshal(block, &b) != nil {
 				continue
 			}
-			var typ string
+			var typ, toolUseID string
 			json.Unmarshal(b["type"], &typ)
 			if typ != "tool_result" {
 				continue
 			}
-			var toolUseID string
 			json.Unmarshal(b["tool_use_id"], &toolUseID)
-			info, ok := toolUseMap[toolUseID]
-			if !ok || info.name != "Read" {
+
+			filePath, isRead := readToolUses[toolUseID]
+			if !isRead {
 				continue
 			}
 
-			// Check if error
+			// Skip errors
 			var isErr bool
 			if errField, ok := b["is_error"]; ok {
 				json.Unmarshal(errField, &isErr)
@@ -311,26 +329,24 @@ func (r *DeduplicateReadRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Compa
 				continue
 			}
 
-			contentRaw := b["content"]
-			hash := sha256.Sum256(contentRaw)
-			key := readKey{filePath: info.filePath, contentHash: fmt.Sprintf("%x", hash[:8])}
-
-			if firstUUID, seen := firstSeen[key]; seen {
-				// Replace content with back-reference
-				origSize := len(contentRaw)
-				replacement := fmt.Sprintf("[duplicate Read of %s — same content as message %s]",
-					info.filePath, firstUUID)
-				newContent, _ := json.Marshal([]map[string]string{
-					{"type": "text", "text": replacement},
-				})
-				b["content"] = newContent
-				blocks[i], _ = json.Marshal(b)
-				modified = true
-				deduped++
-				savedBytes += int64(origSize) - int64(len(newContent))
-			} else {
-				firstSeen[key] = e.UUID
+			// Is this the last Read of this file?
+			if lastReadID[filePath] == toolUseID {
+				continue // keep full content
 			}
+
+			// Truncate: measure original, replace with placeholder
+			origContent := b["content"]
+			origSize := len(origContent)
+			shortName := filePath
+			if idx := strings.LastIndex(filePath, "/"); idx >= 0 {
+				shortName = filePath[idx+1:]
+			}
+			placeholder := fmt.Sprintf("[Read %s — %s, see later read]",
+				shortName, humanBytes(int64(origSize)))
+			b["content"], _ = json.Marshal(placeholder)
+			blocks[i], _ = json.Marshal(b)
+			modified = true
+			truncated++
 		}
 
 		if modified {
@@ -340,10 +356,8 @@ func (r *DeduplicateReadRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, Compa
 
 	report.BytesAfter = entriesSize(entries)
 	report.BytesSaved = report.BytesBefore - report.BytesAfter
-	report.EntriesRemoved = 0 // entries are modified, not removed
-	if deduped > 0 {
-		report.Details = append(report.Details, fmt.Sprintf("deduplicated %d Read results, saved %s",
-			deduped, humanBytes(savedBytes)))
+	if truncated > 0 {
+		report.Details = append(report.Details, fmt.Sprintf("truncated %d old Read results", truncated))
 	}
 	return entries, report
 }

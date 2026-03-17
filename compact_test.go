@@ -325,6 +325,120 @@ func TestCompactPreservesMessageID(t *testing.T) {
 	}
 }
 
+// TestTruncateOldReads verifies that non-last Reads of the same file are truncated.
+func TestTruncateOldReads(t *testing.T) {
+	entries := []*JSONLEntry{
+		makeEntry("a", "", "user", "hello"),
+		// First Read of file.ts
+		makeEntryWithMessage("b", "a", "assistant", &EntryMessage{
+			Role: "assistant",
+			Content: mustMarshal([]map[string]interface{}{
+				{"type": "tool_use", "id": "tu1", "name": "Read", "input": map[string]string{"file_path": "/tmp/file.ts"}},
+			}),
+			ID: "msg1",
+		}),
+		makeEntryWithMessage("c", "b", "user", &EntryMessage{
+			Role: "user",
+			Content: mustMarshal([]map[string]interface{}{
+				{"type": "tool_result", "tool_use_id": "tu1", "content": "line1\nline2\nline3\nthis is the full file content that is quite long"},
+			}),
+		}),
+		// Some work
+		makeEntryWithMessage("d", "c", "assistant", &EntryMessage{
+			Role:    "assistant",
+			Content: mustMarshal([]map[string]string{{"type": "text", "text": "I see the file"}}),
+			ID:      "msg2",
+		}),
+		// Second Read of same file (last)
+		makeEntryWithMessage("e", "d", "assistant", &EntryMessage{
+			Role: "assistant",
+			Content: mustMarshal([]map[string]interface{}{
+				{"type": "tool_use", "id": "tu2", "name": "Read", "input": map[string]string{"file_path": "/tmp/file.ts"}},
+			}),
+			ID: "msg3",
+		}),
+		makeEntryWithMessage("f", "e", "user", &EntryMessage{
+			Role: "user",
+			Content: mustMarshal([]map[string]interface{}{
+				{"type": "tool_result", "tool_use_id": "tu2", "content": "line1\nline2\nline3\nupdated content"},
+			}),
+		}),
+	}
+
+	rule := &TruncateOldReadsRule{}
+	result, report := rule.Apply(entries)
+
+	if report.BytesSaved <= 0 {
+		t.Error("expected bytes saved > 0")
+	}
+
+	// Verify first Read was truncated
+	for _, e := range result {
+		if e.UUID != "c" {
+			continue
+		}
+		var blocks []json.RawMessage
+		json.Unmarshal(e.Message.Content, &blocks)
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			json.Unmarshal(block, &b)
+			var content string
+			json.Unmarshal(b["content"], &content)
+			if content == "line1\nline2\nline3\nthis is the full file content that is quite long" {
+				t.Error("first Read should have been truncated")
+			}
+			if len(content) > 100 {
+				t.Errorf("truncated content too long: %d chars", len(content))
+			}
+		}
+	}
+
+	// Verify second Read was NOT truncated
+	for _, e := range result {
+		if e.UUID != "f" {
+			continue
+		}
+		var blocks []json.RawMessage
+		json.Unmarshal(e.Message.Content, &blocks)
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			json.Unmarshal(block, &b)
+			var content string
+			json.Unmarshal(b["content"], &content)
+			if content != "line1\nline2\nline3\nupdated content" {
+				t.Errorf("last Read should not be truncated, got: %s", content)
+			}
+		}
+	}
+}
+
+// TestTruncateOldReadsKeepsSingleRead verifies single Reads are not touched.
+func TestTruncateOldReadsKeepsSingleRead(t *testing.T) {
+	entries := []*JSONLEntry{
+		makeEntry("a", "", "user", "hello"),
+		makeEntryWithMessage("b", "a", "assistant", &EntryMessage{
+			Role: "assistant",
+			Content: mustMarshal([]map[string]interface{}{
+				{"type": "tool_use", "id": "tu1", "name": "Read", "input": map[string]string{"file_path": "/tmp/only.ts"}},
+			}),
+			ID: "msg1",
+		}),
+		makeEntryWithMessage("c", "b", "user", &EntryMessage{
+			Role: "user",
+			Content: mustMarshal([]map[string]interface{}{
+				{"type": "tool_result", "tool_use_id": "tu1", "content": "full content here"},
+			}),
+		}),
+	}
+
+	rule := &TruncateOldReadsRule{}
+	_, report := rule.Apply(entries)
+
+	if report.BytesSaved != 0 {
+		t.Errorf("single Read should not be truncated, but saved %d bytes", report.BytesSaved)
+	}
+}
+
 // TestCompactOnRealSession tests compact on a real session file if available.
 func TestCompactOnRealSession(t *testing.T) {
 	// Use a known test session if it exists
