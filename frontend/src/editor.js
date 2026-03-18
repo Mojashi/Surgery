@@ -259,6 +259,13 @@ function renderContentBlock(c) {
       : (c.content || '');
     return `<div class="tool-detail"><div class="tool-name ${isErr ? 'tool-result-err' : 'tool-result-ok'}">${isErr ? '❌' : '✅'} result</div><div class="tool-body">${escHtml(content.slice(0, 500))}${content.length > 500 ? '\n…' : ''}</div></div>`;
   }
+  if (type === 'image') {
+    const src = c.source || {};
+    if (src.type === 'base64' && src.data && src.media_type) {
+      return `<div class="msg-image"><img src="data:${escHtml(src.media_type)};base64,${src.data}" style="max-width:100%;max-height:400px;border-radius:4px;border:1px solid #ddd;"></div>`;
+    }
+    return `<div class="tool-detail"><div class="tool-body">🖼 image (${escHtml(src.media_type || 'unknown')})</div></div>`;
+  }
   return `<div class="tool-detail"><div class="tool-body">${escHtml(JSON.stringify(c).slice(0, 200))}</div></div>`;
 }
 

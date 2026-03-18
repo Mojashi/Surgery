@@ -21,6 +21,15 @@ var html2pngBin []byte
 //go:embed scripts/pdf2png
 var pdf2pngBin []byte
 
+// largeImageBase64Threshold is the base64 string length above which an image
+// block is preserved as-is rather than re-rendered into the chat HTML.
+// 50KB of base64 ≈ 37.5KB of raw image data.
+const largeImageBase64Threshold = 50 * 1024
+
+// conversationHistoryMarkerPrefix is the prefix for the text block that marks
+// rendered conversation history. Used to detect already-surgeried content.
+const conversationHistoryMarkerPrefix = "[conversation history rendered as "
+
 // --- Rule: TextToImageRule ---
 // Renders the entire conversation as a chat-style HTML document and converts
 // it to images (one per page). The original entries are replaced with a compact
@@ -28,6 +37,113 @@ var pdf2pngBin []byte
 // assistant+user pair (kept as text so Claude can continue naturally).
 
 type TextToImageRule struct{}
+
+// imageBlockBase64Size returns the length of the base64 data string in an image
+// content block, or 0 if the block is not an image.
+// imageBlockFingerprint returns a short fingerprint for deduplication.
+func imageBlockFingerprint(b map[string]json.RawMessage) string {
+	var source map[string]json.RawMessage
+	if json.Unmarshal(b["source"], &source) != nil {
+		return ""
+	}
+	var data string
+	if json.Unmarshal(source["data"], &data) != nil {
+		return ""
+	}
+	if len(data) > 64 {
+		return data[:64]
+	}
+	return data
+}
+
+func imageBlockBase64Size(b map[string]json.RawMessage) int {
+	var typ string
+	if json.Unmarshal(b["type"], &typ) != nil || typ != "image" {
+		return 0
+	}
+	var source map[string]json.RawMessage
+	if json.Unmarshal(b["source"], &source) != nil {
+		return 0
+	}
+	var data string
+	if json.Unmarshal(source["data"], &data) != nil {
+		return 0
+	}
+	return len(data)
+}
+
+// collectLargeImageBlocks scans entries for image content blocks whose base64
+// data exceeds threshold bytes, returning them as raw JSON blocks.
+func collectLargeImageBlocks(entries []*JSONLEntry, threshold int) []json.RawMessage {
+	var result []json.RawMessage
+	for _, e := range entries {
+		if e.Message == nil {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(e.Message.Content, &blocks) != nil {
+			continue
+		}
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			if imageBlockBase64Size(b) >= threshold {
+				result = append(result, block)
+			}
+		}
+	}
+	return result
+}
+
+// collectSurgeriedImages extracts ALL image blocks from entries that contain
+// the surgery marker text. This ensures idempotency regardless of image size:
+// previously-surgeried page images are always preserved as-is.
+func collectSurgeriedImages(entries []*JSONLEntry) []json.RawMessage {
+	var result []json.RawMessage
+	for _, e := range entries {
+		if e.Message == nil {
+			continue
+		}
+		var blocks []json.RawMessage
+		if json.Unmarshal(e.Message.Content, &blocks) != nil {
+			continue
+		}
+		// Check if this entry contains the surgery marker
+		hasMarker := false
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			var typ string
+			json.Unmarshal(b["type"], &typ)
+			if typ == "text" {
+				var text string
+				json.Unmarshal(b["text"], &text)
+				if strings.HasPrefix(text, conversationHistoryMarkerPrefix) {
+					hasMarker = true
+					break
+				}
+			}
+		}
+		if !hasMarker {
+			continue
+		}
+		// Collect all image blocks from this surgeried entry
+		for _, block := range blocks {
+			var b map[string]json.RawMessage
+			if json.Unmarshal(block, &b) != nil {
+				continue
+			}
+			if imageBlockBase64Size(b) > 0 {
+				result = append(result, block)
+			}
+		}
+	}
+	return result
+}
 
 func (r *TextToImageRule) Name() string { return "text-to-image" }
 func (r *TextToImageRule) Description() string {
@@ -49,31 +165,74 @@ func (r *TextToImageRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRu
 	toRender := entries[:splitIdx]
 	toKeep := entries[splitIdx:]
 
-	// Render to page images
-	chatHTML := buildChatHTML(toRender)
-	pngPages, err := renderHTMLParallel([]string{chatHTML}, nil)
-	if err != nil {
-		report.Details = append(report.Details, fmt.Sprintf("render failed: %v", err))
+	// Extract images from previously-surgeried entries (idempotency).
+	// These are preserved as-is regardless of size.
+	surgeriedImages := collectSurgeriedImages(toRender)
+
+	// Also collect any other large image blocks (non-surgeried but big).
+	largeImages := collectLargeImageBlocks(toRender, largeImageBase64Threshold)
+
+	// Merge: surgeried images first, then large images not already covered.
+	// Use a set to avoid duplicates.
+	preservedSet := make(map[string]bool) // base64 data prefix → seen
+	var imgBlocks []any
+	for _, img := range surgeriedImages {
+		var block any
+		json.Unmarshal(img, &block)
+		imgBlocks = append(imgBlocks, block)
+		// Track by first 64 chars of data to detect duplicates
+		var b map[string]json.RawMessage
+		json.Unmarshal(img, &b)
+		preservedSet[imageBlockFingerprint(b)] = true
+	}
+	for _, img := range largeImages {
+		var b map[string]json.RawMessage
+		json.Unmarshal(img, &b)
+		fp := imageBlockFingerprint(b)
+		if preservedSet[fp] {
+			continue
+		}
+		preservedSet[fp] = true
+		var block any
+		json.Unmarshal(img, &block)
+		imgBlocks = append(imgBlocks, block)
+	}
+	preservedCount := len(imgBlocks)
+
+	// Render remaining content (buildChatSections skips large images, surgeried images, and markers)
+	body := buildChatSections(toRender)
+	if strings.TrimSpace(body) != "" {
+		chatHTML := wrapChatHTML(body)
+		pngPages, err := renderHTMLParallel([]string{chatHTML}, nil)
+		if err != nil {
+			report.Details = append(report.Details, fmt.Sprintf("render failed: %v", err))
+			report.BytesAfter = report.BytesBefore
+			return entries, report
+		}
+		for _, pngData := range pngPages {
+			imgBlocks = append(imgBlocks, map[string]any{
+				"type": "image",
+				"source": map[string]string{
+					"type":       "base64",
+					"media_type": detectImageMediaType(pngData),
+					"data":       base64.StdEncoding.EncodeToString(pngData),
+				},
+			})
+		}
+	}
+
+	if len(imgBlocks) == 0 {
+		report.Details = append(report.Details, "no content to render")
 		report.BytesAfter = report.BytesBefore
 		return entries, report
 	}
 
-	// Build image content blocks
-	var imgBlocks []any
-	for _, pngData := range pngPages {
-		imgBlocks = append(imgBlocks, map[string]any{
-			"type": "image",
-			"source": map[string]string{
-				"type":       "base64",
-				"media_type": detectImageMediaType(pngData),
-				"data":       base64.StdEncoding.EncodeToString(pngData),
-			},
-		})
-	}
+	// Count page images (excludes preserved images)
+	pageCount := len(imgBlocks) - preservedCount
 	// Add a text block explaining this is a rendered conversation
 	imgBlocks = append(imgBlocks, map[string]string{
 		"type": "text",
-		"text": fmt.Sprintf("[conversation history rendered as %d page image(s)]", len(pngPages)),
+		"text": fmt.Sprintf("[conversation history rendered as %d page image(s)]", pageCount),
 	})
 	imgContent, _ := json.Marshal(imgBlocks)
 
@@ -108,8 +267,8 @@ func (r *TextToImageRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRu
 	report.BytesSaved = report.BytesBefore - report.BytesAfter
 	report.EntriesRemoved = len(entries) - len(result)
 	report.Details = append(report.Details,
-		fmt.Sprintf("rendered %d entries as %d page image(s), kept %d trailing entries",
-			len(toRender), len(pngPages), len(toKeep)))
+		fmt.Sprintf("rendered %d entries as %d page image(s) (%d preserved), kept %d trailing entries",
+			len(toRender), pageCount, preservedCount, len(toKeep)))
 
 	return result, report
 }
@@ -131,11 +290,43 @@ func findImageBoundary(entries []*JSONLEntry) int {
 	return lastAssistant
 }
 
+// isSurgeriedEntry returns true if the entry contains the surgery marker text,
+// indicating it was produced by a previous surgery run.
+func isSurgeriedEntry(e *JSONLEntry) bool {
+	if e.Message == nil {
+		return false
+	}
+	var blocks []json.RawMessage
+	if json.Unmarshal(e.Message.Content, &blocks) != nil {
+		return false
+	}
+	for _, block := range blocks {
+		var b map[string]json.RawMessage
+		if json.Unmarshal(block, &b) != nil {
+			continue
+		}
+		var typ string
+		json.Unmarshal(b["type"], &typ)
+		if typ == "text" {
+			var text string
+			json.Unmarshal(b["text"], &text)
+			if strings.HasPrefix(text, conversationHistoryMarkerPrefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // buildChatSections renders entries to HTML section strings (one per entry).
 func buildChatSections(entries []*JSONLEntry) string {
 	var sections strings.Builder
 	for _, e := range entries {
 		if e.Message == nil {
+			continue
+		}
+		// Skip entire surgeried entries — their images are preserved independently
+		if isSurgeriedEntry(e) {
 			continue
 		}
 		role := e.Message.Role
@@ -164,10 +355,13 @@ func buildChatSections(entries []*JSONLEntry) string {
 			case "text":
 				var text string
 				json.Unmarshal(b["text"], &text)
-				if text != "" {
+				if text != "" && !strings.HasPrefix(text, conversationHistoryMarkerPrefix) {
 					sections.WriteString(renderChatBubble(role, html.EscapeString(text)))
 				}
 			case "image":
+				if imageBlockBase64Size(b) >= largeImageBase64Threshold {
+					continue // preserved independently
+				}
 				sections.WriteString(renderImageBlock(b))
 			case "document":
 				sections.WriteString(renderDocumentBlock(b))

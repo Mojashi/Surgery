@@ -37,7 +37,8 @@ func main() {
 		runUpdate()
 
 	case len(args) >= 1 && args[0] == "view":
-		runViewCLI(args[1:])
+		// GUI editor
+		runGUI(argStr(args, 1), argStr(args, 2))
 
 	case len(args) >= 1 && args[0] == "--open":
 		// Open Wails window, optionally with a specific session
@@ -70,8 +71,8 @@ func main() {
 		runNotifyWindow(title, string(msg))
 
 	case len(args) == 0:
-		// No arguments: open GUI (also needed for Wails binding generation)
-		runGUI("", "")
+		// No arguments: compact (text-to-image)
+		runCompactCLI(args)
 
 	default:
 		// Default command: compact (text-to-image)
@@ -356,16 +357,66 @@ func cliUpdate(downloadURL, newVersion string) error {
 func runCompactCLI(args []string) {
 	for _, a := range args {
 		if a == "--help" || a == "-h" {
-			fmt.Fprintln(os.Stderr, "Usage: !surgery compact")
+			fmt.Fprintln(os.Stderr, "Usage: surgery compact [session-id] [--dry-run] [--inplace]")
 			fmt.Fprintln(os.Stderr, "  Renders conversation history as images for token efficiency.")
-			fmt.Fprintln(os.Stderr, "  Must be run inside Claude Code.")
+			fmt.Fprintln(os.Stderr, "  Inside Claude Code: !surgery compact")
+			fmt.Fprintln(os.Stderr, "  CLI: surgery compact <session-id> [--dry-run] [--inplace]")
 			os.Exit(0)
 		}
 	}
 
+	// Parse flags
+	dryRun := false
+	inplace := false
+	var sessionID string
+	for _, a := range args {
+		switch a {
+		case "compact":
+			// skip
+		case "--dry-run":
+			dryRun = true
+		case "--inplace":
+			inplace = true
+		default:
+			if !strings.HasPrefix(a, "-") {
+				sessionID = a
+			}
+		}
+	}
+
+	// If session ID given, run directly on file (CLI mode)
+	if sessionID != "" {
+		projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
+		jsonlPath := findSessionByID(projectsBase, sessionID)
+		if jsonlPath == "" {
+			fmt.Fprintf(os.Stderr, "Error: session %s not found\n", sessionID)
+			os.Exit(1)
+		}
+		ruleNames := []string{"text-to-image"}
+		if inplace {
+			runCompactInplace(jsonlPath, ruleNames, dryRun)
+		} else {
+			runCompactOnFile(jsonlPath, ruleNames, dryRun)
+		}
+		return
+	}
+
+	// No session ID: if outside Claude Code, auto-detect latest session
 	if os.Getenv("CLAUDECODE") != "1" {
-		fmt.Fprintln(os.Stderr, "Error: surgery compact must be run inside Claude Code (!surgery compact)")
-		os.Exit(1)
+		projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
+		jsonlPath, _ := mostRecentJSONLAllProjects(projectsBase)
+		if jsonlPath == "" {
+			fmt.Fprintln(os.Stderr, "Error: no sessions found")
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "Auto-detected: %s\n", filepath.Base(jsonlPath))
+		ruleNames := []string{"text-to-image"}
+		if inplace {
+			runCompactInplace(jsonlPath, ruleNames, dryRun)
+		} else {
+			runCompactOnFile(jsonlPath, ruleNames, dryRun)
+		}
+		return
 	}
 
 	spawnBackground("compact")
@@ -443,6 +494,46 @@ func runCompactBackground(args []string) {
 	}
 
 	spawnNotify("Surgery Compact", sb.String())
+}
+
+// runCompactInplace runs compaction and overwrites the original JSONL file (same session ID).
+func runCompactInplace(jsonlPath string, ruleNames []string, dryRun bool) {
+	conv, err := LoadConversation(jsonlPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error reading file:", err)
+		os.Exit(1)
+	}
+	beforeCount := conv.EntryCount()
+	beforeTokens := estimateEntryTokens(conv.Entries)
+	if usage, ok := getLastUsage(conv.Entries); ok {
+		beforeTokens = usage.TotalInputTokens()
+	}
+
+	rules := selectRules(ruleNames)
+	report := RunCompaction(conv, rules)
+
+	afterTokens := estimateEntryTokens(conv.Entries)
+	sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
+	printCompactReport(filepath.Base(jsonlPath), beforeCount, conv.EntryCount(), beforeTokens, afterTokens, report)
+
+	if dryRun {
+		fmt.Println("\n(dry run — no changes written)")
+		return
+	}
+
+	// Backup original
+	backupPath := jsonlPath + ".bak"
+	if data, err := os.ReadFile(jsonlPath); err == nil {
+		os.WriteFile(backupPath, data, 0644)
+	}
+
+	// Overwrite in place (same session ID)
+	if err := conv.WriteToFile(jsonlPath); err != nil {
+		fmt.Fprintln(os.Stderr, "Error writing file:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("\nCompacted in place: %s\n", sessionID)
+	fmt.Printf("Backup: %s\n", backupPath)
 }
 
 // runCompactOnFile runs compaction on a JSONL file, writing to a new session file.
@@ -603,20 +694,61 @@ func (c *CompactApp) RunCompact() map[string]string {
 	toRender := conv.Entries[:splitIdx]
 	toKeep := conv.Entries[splitIdx:]
 
-	// Render images in parallel chunks (50 entries per chunk)
-	emit("Rendering images (0%)...")
-	pngPages, err := renderHTMLChunksParallel(toRender, 50, func(done, total int) {
-		pct := done * 100 / total
-		emit(fmt.Sprintf("Rendering images (%d%%, %d/%d chunks)...", pct, done, total))
-	})
-	if err != nil {
-		return map[string]string{"error": fmt.Sprintf("render error: %v", err)}
+	// Preserve images from previously-surgeried entries (idempotency)
+	surgeriedImages := collectSurgeriedImages(toRender)
+	largeImages := collectLargeImageBlocks(toRender, largeImageBase64Threshold)
+
+	// Merge preserved images (surgeried first, then large non-duplicates)
+	preservedSet := make(map[string]bool)
+	var preservedBlocks []json.RawMessage
+	for _, img := range surgeriedImages {
+		var b map[string]json.RawMessage
+		json.Unmarshal(img, &b)
+		preservedSet[imageBlockFingerprint(b)] = true
+		preservedBlocks = append(preservedBlocks, img)
+	}
+	for _, img := range largeImages {
+		var b map[string]json.RawMessage
+		json.Unmarshal(img, &b)
+		if preservedSet[imageBlockFingerprint(b)] {
+			continue
+		}
+		preservedSet[imageBlockFingerprint(b)] = true
+		preservedBlocks = append(preservedBlocks, img)
+	}
+
+	// Filter entries for rendering: skip surgeried entries and large images
+	var renderEntries []*JSONLEntry
+	for _, e := range toRender {
+		if !isSurgeriedEntry(e) {
+			renderEntries = append(renderEntries, e)
+		}
+	}
+
+	// Render non-preserved content as images
+	var pngPages [][]byte
+	if len(renderEntries) > 0 {
+		emit("Rendering images (0%)...")
+		var err error
+		pngPages, err = renderHTMLChunksParallel(renderEntries, 50, func(done, total int) {
+			pct := done * 100 / total
+			emit(fmt.Sprintf("Rendering images (%d%%, %d/%d chunks)...", pct, done, total))
+		})
+		if err != nil {
+			return map[string]string{"error": fmt.Sprintf("render error: %v", err)}
+		}
 	}
 
 	emit("Building output...")
 
-	// Build image content blocks
+	// Build image content blocks: preserved first, then newly rendered
 	var imgBlocks []any
+	for _, img := range preservedBlocks {
+		var block any
+		json.Unmarshal(img, &block)
+		imgBlocks = append(imgBlocks, block)
+	}
+	newPageCount := len(pngPages)
 	for _, pngData := range pngPages {
 		imgBlocks = append(imgBlocks, map[string]any{
 			"type": "image",
@@ -629,7 +761,7 @@ func (c *CompactApp) RunCompact() map[string]string {
 	}
 	imgBlocks = append(imgBlocks, map[string]string{
 		"type": "text",
-		"text": fmt.Sprintf("[conversation history rendered as %d page image(s)]", len(pngPages)),
+		"text": fmt.Sprintf("[conversation history rendered as %d page image(s)]", newPageCount),
 	})
 	imgContent, _ := json.Marshal(imgBlocks)
 
@@ -666,12 +798,21 @@ func (c *CompactApp) RunCompact() map[string]string {
 	}
 
 	afterTokens := estimateEntryTokens(result)
-	reportText := fmt.Sprintf("%d entries → %d entries, %d page images\n~%d tokens → ~%d tokens",
-		beforeCount, len(result), len(pngPages), beforeTokens, afterTokens)
+	reportText := fmt.Sprintf("%d entries → %d entries, %d preserved + %d new page images\n~%d tokens → ~%d tokens",
+		beforeCount, len(result), len(preservedBlocks), newPageCount, beforeTokens, afterTokens)
 
-	// Build preview HTML showing all rendered page images
+	// Build preview HTML showing ALL images (preserved + newly rendered)
 	var previewBuf strings.Builder
 	previewBuf.WriteString(`<!DOCTYPE html><html><head><style>body{margin:0;padding:8px;background:#1a1a1a;display:flex;flex-direction:column;gap:4px;}img{width:100%;display:block;border-radius:4px;}</style></head><body>`)
+	// Preserved images
+	for _, img := range preservedBlocks {
+		var b map[string]json.RawMessage
+		json.Unmarshal(img, &b)
+		var source map[string]string
+		json.Unmarshal(b["source"], &source)
+		previewBuf.WriteString(fmt.Sprintf(`<img src="data:%s;base64,%s">`, source["media_type"], source["data"]))
+	}
+	// Newly rendered pages
 	for _, pngData := range pngPages {
 		mt := detectImageMediaType(pngData)
 		b64 := base64.StdEncoding.EncodeToString(pngData)
