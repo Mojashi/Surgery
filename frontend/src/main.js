@@ -1,8 +1,8 @@
 import './style.css';
-import { initCompactMode, initNotifyMode } from './modes.js';
+import { initCompactMode, initNotifyMode, initBranchMode } from './modes.js';
 
 function waitForWails(cb) {
-  if (window.go?.main?.App || window.go?.main?.NotifyApp || window.go?.main?.CompactApp) { cb(); return; }
+  if (window.go?.main?.App || window.go?.main?.NotifyApp || window.go?.main?.CompactApp || window.go?.main?.BranchApp) { cb(); return; }
   setTimeout(() => waitForWails(cb), 50);
 }
 
@@ -10,6 +10,12 @@ waitForWails(async () => {
   // Compact mode — standalone window
   if (window.go?.main?.CompactApp) {
     await initCompactMode();
+    return;
+  }
+
+  // Branch mode — standalone window
+  if (window.go?.main?.BranchApp) {
+    await initBranchMode();
     return;
   }
 

@@ -36,9 +36,17 @@ func main() {
 	case len(args) >= 1 && args[0] == "update":
 		runUpdate()
 
+	case len(args) >= 1 && args[0] == "compact":
+		// Compact (text-to-image)
+		runCompactCLI(args)
+
+	case len(args) >= 1 && args[0] == "branch":
+		// Branch session
+		runBranchCLI(args)
+
 	case len(args) >= 1 && args[0] == "view":
-		// GUI editor
-		runGUI(argStr(args, 1), argStr(args, 2))
+		// GUI editor (explicit)
+		runViewCLI(args[1:])
 
 	case len(args) >= 1 && args[0] == "--open":
 		// Open Wails window, optionally with a specific session
@@ -61,6 +69,10 @@ func main() {
 		// Open compact dialog with a JSONL path
 		runCompactWindow(argStr(args, 1))
 
+	case len(args) >= 1 && args[0] == "--branch-window":
+		// Open branch dialog with a JSONL path
+		runBranchWindow(argStr(args, 1))
+
 	case len(args) >= 1 && args[0] == "--notify":
 		// Show a notification popup (title from arg, message from stdin)
 		title := argStr(args, 1)
@@ -71,12 +83,12 @@ func main() {
 		runNotifyWindow(title, string(msg))
 
 	case len(args) == 0:
-		// No arguments: compact (text-to-image)
-		runCompactCLI(args)
+		// No arguments: open GUI (view)
+		runViewCLI(args)
 
 	default:
-		// Default command: compact (text-to-image)
-		runCompactCLI(args)
+		// Default: open GUI (view)
+		runViewCLI(args)
 	}
 }
 
@@ -113,8 +125,12 @@ func runViewCLI(args []string) {
 	if os.Getenv("CLAUDECODE") == "1" {
 		spawnBackground("open")
 	} else {
-		projectID := deriveProjectID()
-		runGUI(projectID, "")
+		projectID := argStr(args, 0)
+		sessionID := argStr(args, 1)
+		if projectID == "" {
+			projectID = deriveProjectID()
+		}
+		runGUI(projectID, sessionID)
 	}
 }
 
@@ -153,6 +169,9 @@ func runBg(args []string) {
 
 	case "compact":
 		spawnCompactWindow(jsonlPath)
+
+	case "branch":
+		spawnBranchWindow(jsonlPath)
 	}
 }
 
@@ -929,5 +948,160 @@ func selectRules(names []string) []CompactRule {
 		}
 	}
 	return rules
+}
+
+// --- Branch ---
+
+func runBranchCLI(args []string) {
+	for _, a := range args {
+		if a == "--help" || a == "-h" {
+			fmt.Fprintln(os.Stderr, "Usage: surgery branch [session-id]")
+			fmt.Fprintln(os.Stderr, "  Branch a conversation at a chosen point.")
+			fmt.Fprintln(os.Stderr, "  Inside Claude Code: !surgery branch")
+			os.Exit(0)
+		}
+	}
+
+	var sessionID string
+	for _, a := range args {
+		if a != "branch" && !strings.HasPrefix(a, "-") {
+			sessionID = a
+		}
+	}
+
+	if sessionID != "" {
+		// Direct: open branch window for the given session
+		projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
+		jsonlPath := findSessionByID(projectsBase, sessionID)
+		if jsonlPath == "" {
+			fmt.Fprintf(os.Stderr, "Error: session %s not found\n", sessionID)
+			os.Exit(1)
+		}
+		runBranchWindow(jsonlPath)
+		return
+	}
+
+	if os.Getenv("CLAUDECODE") == "1" {
+		spawnBackground("branch")
+		return
+	}
+
+	// Auto-detect latest session
+	projectsBase := filepath.Join(os.Getenv("HOME"), ".claude", "projects")
+	jsonlPath, _ := mostRecentJSONLAllProjects(projectsBase)
+	if jsonlPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: no sessions found")
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "Auto-detected: %s\n", filepath.Base(jsonlPath))
+	runBranchWindow(jsonlPath)
+}
+
+func spawnBranchWindow(jsonlPath string) {
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "--branch-window", jsonlPath)
+	cmd.Start()
+}
+
+// BranchApp is the Wails app for the branch window.
+type BranchApp struct {
+	ctx       context.Context
+	jsonlPath string
+}
+
+func (b *BranchApp) startup(ctx context.Context) { b.ctx = ctx }
+
+// BranchMessage is a lightweight message for the branch UI.
+type BranchMessage struct {
+	UUID    string `json:"uuid"`
+	Role    string `json:"role"`
+	Preview string `json:"preview"`
+	Index   int    `json:"index"`
+}
+
+// GetMessages returns the conversation messages for the branch UI.
+func (b *BranchApp) GetMessages() map[string]any {
+	conv, err := LoadConversation(b.jsonlPath)
+	if err != nil {
+		return map[string]any{"error": fmt.Sprintf("load error: %v", err)}
+	}
+
+	var messages []BranchMessage
+	for i, e := range conv.Entries {
+		if !e.IsMessage() {
+			continue
+		}
+		role := e.Type
+		if e.Message != nil {
+			role = e.Message.Role
+		}
+		preview := ""
+		if e.Message != nil {
+			cs := parseContentSummary(e.Message.Content)
+			preview = cs.TextPreview
+		}
+		if preview == "" {
+			preview = fmt.Sprintf("(%s)", role)
+		}
+		messages = append(messages, BranchMessage{
+			UUID:    e.UUID,
+			Role:    role,
+			Preview: preview,
+			Index:   i,
+		})
+	}
+
+	return map[string]any{
+		"messages":   messages,
+		"session_id": strings.TrimSuffix(filepath.Base(b.jsonlPath), ".jsonl"),
+		"count":      len(conv.Entries),
+	}
+}
+
+// DoBranch creates a new session truncated after the given UUID.
+func (b *BranchApp) DoBranch(uuid string) map[string]string {
+	conv, err := LoadConversation(b.jsonlPath)
+	if err != nil {
+		return map[string]string{"error": fmt.Sprintf("load error: %v", err)}
+	}
+
+	conv.TruncateAfter(uuid)
+
+	newID := generateUUID()
+	conv.SessionID = newID
+	for _, e := range conv.Entries {
+		e.SessionID = newID
+	}
+
+	dir := filepath.Dir(b.jsonlPath)
+	newPath := filepath.Join(dir, newID+".jsonl")
+	if err := conv.WriteToFile(newPath); err != nil {
+		return map[string]string{"error": fmt.Sprintf("write error: %v", err)}
+	}
+
+	origID := strings.TrimSuffix(filepath.Base(b.jsonlPath), ".jsonl")
+	return map[string]string{
+		"session_id":   newID,
+		"original_id":  origID,
+		"entry_count":  fmt.Sprintf("%d", len(conv.Entries)),
+		"resume_cmd":   "claude --resume " + newID,
+		"resume_slash": "/resume " + newID,
+	}
+}
+
+func runBranchWindow(jsonlPath string) {
+	app := &BranchApp{jsonlPath: jsonlPath}
+	wails.Run(&options.App{
+		Title:            "Surgery Branch",
+		Width:            800,
+		Height:           600,
+		DisableResize:    false,
+		BackgroundColour: &options.RGBA{R: 13, G: 17, B: 23, A: 1},
+		AssetServer: &assetserver.Options{
+			Assets: assets,
+		},
+		OnStartup: app.startup,
+		Bind:      []interface{}{app},
+	})
 }
 

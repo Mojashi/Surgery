@@ -82,6 +82,92 @@ export async function initCompactMode() {
   }
 }
 
+export async function initBranchMode() {
+  const app = window.go.main.BranchApp;
+  modeShell();
+
+  const title = document.createElement('h2');
+  title.textContent = '🌿 Surgery Branch';
+  title.style.cssText = 'color:#58a6ff;margin-bottom:12px;font-size:16px;flex-shrink:0;';
+  document.body.appendChild(title);
+
+  const status = document.createElement('p');
+  status.textContent = 'Loading messages...';
+  status.style.cssText = 'color:#8b949e;font-size:13px;margin-bottom:12px;flex-shrink:0;';
+  document.body.appendChild(status);
+
+  const resultDiv = document.createElement('div');
+  resultDiv.style.cssText = 'flex-shrink:0;';
+  document.body.appendChild(resultDiv);
+
+  const listDiv = document.createElement('div');
+  listDiv.style.cssText = 'flex:1;overflow-y:auto;min-height:0;border:1px solid #30363d;border-radius:6px;background:#161b22;';
+  document.body.appendChild(listDiv);
+
+  const data = await app.GetMessages();
+  if (data.error) {
+    status.textContent = 'Error: ' + data.error;
+    status.style.color = '#f85149';
+    return;
+  }
+
+  const messages = data.messages || [];
+  status.textContent = `${messages.length} messages — click to branch after that message`;
+
+  for (const msg of messages) {
+    const row = document.createElement('div');
+    row.style.cssText = 'padding:8px 12px;border-bottom:1px solid #21262d;cursor:pointer;display:flex;gap:8px;align-items:baseline;transition:background 0.1s;';
+    row.onmouseenter = () => row.style.background = '#1f2937';
+    row.onmouseleave = () => row.style.background = 'transparent';
+
+    const badge = document.createElement('span');
+    badge.textContent = msg.role === 'assistant' ? 'A' : msg.role === 'user' ? 'U' : msg.role[0].toUpperCase();
+    badge.style.cssText = `display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;border-radius:4px;font-size:11px;font-weight:600;flex-shrink:0;color:#fff;background:${msg.role === 'assistant' ? '#8b5cf6' : msg.role === 'user' ? '#2563eb' : '#6b7280'};`;
+
+    const text = document.createElement('span');
+    text.textContent = msg.preview.length > 120 ? msg.preview.slice(0, 120) + '…' : msg.preview;
+    text.style.cssText = 'font-size:13px;color:#c9d1d9;line-height:1.4;';
+
+    row.appendChild(badge);
+    row.appendChild(text);
+    listDiv.appendChild(row);
+
+    row.onclick = async () => {
+      if (row.dataset.done) return;
+      row.dataset.done = '1';
+      status.textContent = 'Branching...';
+      status.style.color = '#d29922';
+
+      const result = await app.DoBranch(msg.uuid);
+      if (result.error) {
+        status.textContent = 'Error: ' + result.error;
+        status.style.color = '#f85149';
+        delete row.dataset.done;
+        return;
+      }
+
+      status.textContent = `Branched! ${result.entry_count} entries → new session`;
+      status.style.color = '#3fb950';
+
+      resultDiv.innerHTML = '';
+      resultDiv.style.cssText = 'margin-bottom:12px;display:flex;flex-direction:column;gap:6px;flex-shrink:0;';
+      resultDiv.appendChild(makeCopyRow(result.resume_slash));
+      resultDiv.appendChild(makeCopyRow(result.resume_cmd));
+
+      // Highlight the selected row
+      for (const r of listDiv.children) {
+        r.style.opacity = '0.4';
+        r.style.cursor = 'default';
+      }
+      row.style.opacity = '1';
+      row.style.background = '#1a3a2a';
+    };
+  }
+
+  // Scroll to bottom (most recent messages)
+  listDiv.scrollTop = listDiv.scrollHeight;
+}
+
 export async function initNotifyMode() {
   const notify = window.go.main.NotifyApp;
   const data = await notify.GetNotification();
