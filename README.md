@@ -1,8 +1,10 @@
 # Surgery ⚡
 
-**コンテキストエンジニアリングのための Claude Code 会話エディタ**
+**Claude Code の会話をコンパクションして、トークンを大幅削減**
 
-Claude Code の会話履歴（JSONL）を編集するネイティブアプリ。長くなったセッションから不要なやり取りを切り落とし、コンテキストを意図的に設計することでモデルのパフォーマンスを最大化する。
+長くなった Claude Code セッションの会話履歴（JSONL）を画像化・最適化してトークン消費を削減するツール。テキストより画像の方がトークン効率が良いという知見に基づき、過去の会話をチャット風画像に変換する。
+
+**実測**: 122,721 tokens → 65,237 tokens（**46.8% 削減**）
 
 ## インストール
 
@@ -19,64 +21,67 @@ curl -fsSL https://raw.githubusercontent.com/Mojashi/claude-conversation-editor/
 <details>
 <summary>手動インストール</summary>
 
-[Releases](https://github.com/Mojashi/claude-conversation-editor/releases) から最新の `surgery-darwin-arm64.zip` をダウンロードして展開。
+[Releases](https://github.com/Mojashi/claude-conversation-editor/releases) から最新の zip をダウンロードして展開。
 
 ```bash
-cp -r surgery.app /Applications/
-ln -sf /Applications/surgery.app/Contents/MacOS/surgery ~/bin/surgery
+cp -r Surgery.app /Applications/
+ln -sf /Applications/Surgery.app/Contents/MacOS/surgery ~/bin/surgery
 ```
 </details>
 
-## 使い方
+## Compact（メイン機能）
 
-### Claude Code から（推奨）
+会話履歴をチャット風の画像に変換し、トークンを削減する。最後の assistant + user ターンはテキストのまま残すので、Claude は自然に会話を継続できる。
 
-Claude Code のセッション内で `!surgery` を実行:
-
-```
-!surgery
-```
-
-`!` プレフィックスでシェルコマンドとして直接実行される。`CLAUDECODE=1` 環境変数を検出し、現在のセッション JSONL をトークンで特定してウィンドウを開く。
-
-### ターミナルから
+### 使い方
 
 ```bash
-surgery
+# Claude Code のセッション内で（推奨）
+!surgery compact
+
+# ターミナルから（GUI プレビュー付き）
+surgery compact
+
+# ドライランで効果を確認
+surgery compact --dry-run
+surgery compact <session-id> --dry-run
 ```
 
-カレントディレクトリのプロジェクトを開く。セッションは一覧から選択。
+Claude Code 内から実行すると、現在のセッションを自動検出してコンパクト用ウィンドウを開く。完了後:
 
-### Compact（会話の画像化）
+- レンダリング結果のプレビュー
+- compact レポート（エントリ数・トークン数の変化）
+- `/resume` コマンド（コピーボタン付き）
 
-会話履歴をチャット風の画像に変換してトークンを削減する実験的機能。テキストとして送るより画像として送った方がトークン効率が良いという知見（"Text or Pixels"）に基づく。
+### コンパクションの内容
+
+| 処理 | 説明 |
+|------|------|
+| Text-to-Image | 会話全体をチャット風 HTML → WebKit レンダリング → PNG/WebP 画像に変換 |
+| 画像・PDF の埋め込み | 会話中の画像や PDF ドキュメントをそのまま画像内に埋め込み（画像 in 画像） |
+| 冗長な Read 除去 | 同一ファイルの古い Read 結果を切り詰め |
+| 冗長な Write 除去 | 同一ファイルへの古い Write を切り詰め |
+| 成功メッセージ短縮 | 冗長なツール結果を短縮 |
+
+### オプション: WebP 変換
+
+`cwebp` がインストールされていれば自動的に PNG → WebP 変換してさらにサイズを削減。
+
+```bash
+brew install webp
+```
+
+## エディタ（会話の手動編集）
+
+コンパクション以外に、会話を手動で編集する GUI エディタとしても使える。
 
 ```bash
 # Claude Code 内で
-!surgery compact
+!surgery
 
 # ターミナルから
-surgery compact              # GUI で プレビュー → Apply
-surgery compact --dry-run    # レポートのみ（CLI）
-surgery compact <session-id> --dry-run  # 特定セッション
+surgery
 ```
-
-実行するとコンパクト専用ウィンドウが開き、処理中は「Rendering conversation as images...」と表示される。完了後:
-
-- レンダリング結果の HTML プレビュー（iframe）
-- compact レポート（エントリ数・バイト数の変化）
-- `/resume` コマンド（コピーボタン付き）
-
-**依存**: `weasyprint`（HTML→PDF）と `magick`（PDF→PNG）が PATH に必要。
-
-```bash
-pip install weasyprint
-brew install imagemagick
-```
-
-**実測結果**: 122,721 tokens → 65,237 tokens（**46.8% 削減**）。バイトサイズは増加するがトークン数が大幅に減少。
-
-### エディタ操作
 
 | 操作 | 説明 |
 |------|------|
@@ -96,7 +101,7 @@ brew install imagemagick
 ```bash
 # 依存: Go 1.21+, Node 18+, Wails v2
 go install github.com/wailsapp/wails/v2/cmd/wails@latest
-wails build
+make build
 ```
 
 ## License

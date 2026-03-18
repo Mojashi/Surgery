@@ -69,6 +69,10 @@ func main() {
 		msg, _ := io.ReadAll(os.Stdin)
 		runNotifyWindow(title, string(msg))
 
+	case len(args) == 0:
+		// No arguments: open GUI (also needed for Wails binding generation)
+		runGUI("", "")
+
 	default:
 		// Default command: compact (text-to-image)
 		runCompactCLI(args)

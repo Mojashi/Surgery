@@ -22,6 +22,14 @@ export function CheckUpdate() {
   return window['go']['main']['App']['CheckUpdate']();
 }
 
+export function CompactToImageApply(arg1, arg2) {
+  return window['go']['main']['App']['CompactToImageApply'](arg1, arg2);
+}
+
+export function CompactToImagePreview(arg1, arg2) {
+  return window['go']['main']['App']['CompactToImagePreview'](arg1, arg2);
+}
+
 export function DoUpdate(arg1) {
   return window['go']['main']['App']['DoUpdate'](arg1);
 }
@@ -32,6 +40,14 @@ export function EditMessage(arg1, arg2, arg3, arg4) {
 
 export function ExecClaude(arg1, arg2, arg3, arg4) {
   return window['go']['main']['App']['ExecClaude'](arg1, arg2, arg3, arg4);
+}
+
+export function FastCompact(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['App']['FastCompact'](arg1, arg2, arg3, arg4);
+}
+
+export function FixSession(arg1, arg2) {
+  return window['go']['main']['App']['FixSession'](arg1, arg2);
 }
 
 export function GetAvailableTerminals() {
@@ -80,4 +96,8 @@ export function SaveConversation(arg1, arg2, arg3) {
 
 export function SummarizeMessages(arg1, arg2, arg3) {
   return window['go']['main']['App']['SummarizeMessages'](arg1, arg2, arg3);
+}
+
+export function ValidateSession(arg1, arg2) {
+  return window['go']['main']['App']['ValidateSession'](arg1, arg2);
 }

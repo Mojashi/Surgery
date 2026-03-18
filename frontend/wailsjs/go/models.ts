@@ -1,5 +1,163 @@
 export namespace main {
 	
+	export class ChainIssue {
+	    index: number;
+	    uuid: string;
+	    type: string;
+	    parent_uuid: string;
+	    problem: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ChainIssue(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.index = source["index"];
+	        this.uuid = source["uuid"];
+	        this.type = source["type"];
+	        this.parent_uuid = source["parent_uuid"];
+	        this.problem = source["problem"];
+	    }
+	}
+	export class CompactMetadata {
+	    trigger: string;
+	    preTokens: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new CompactMetadata(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.trigger = source["trigger"];
+	        this.preTokens = source["preTokens"];
+	    }
+	}
+	export class CompactRuleReport {
+	    entries_removed: number;
+	    bytes_before: number;
+	    bytes_after: number;
+	    bytes_saved: number;
+	    details?: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new CompactRuleReport(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.entries_removed = source["entries_removed"];
+	        this.bytes_before = source["bytes_before"];
+	        this.bytes_after = source["bytes_after"];
+	        this.bytes_saved = source["bytes_saved"];
+	        this.details = source["details"];
+	    }
+	}
+	export class CompactRuleResult {
+	    name: string;
+	    report: CompactRuleReport;
+	
+	    static createFrom(source: any = {}) {
+	        return new CompactRuleResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.report = this.convertValues(source["report"], CompactRuleReport);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class CompactReport {
+	    rules: CompactRuleResult[];
+	    total_before: number;
+	    total_after: number;
+	    total_saved: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new CompactReport(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.rules = this.convertValues(source["rules"], CompactRuleResult);
+	        this.total_before = source["total_before"];
+	        this.total_after = source["total_after"];
+	        this.total_saved = source["total_saved"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
+	
+	export class CompactToImageResult {
+	    html: string;
+	    report: CompactReport;
+	    new_session: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new CompactToImageResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.html = source["html"];
+	        this.report = this.convertValues(source["report"], CompactReport);
+	        this.new_session = source["new_session"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
 	export class ContentSummary {
 	    types: string[];
 	    text_preview: string;
@@ -26,6 +184,8 @@ export namespace main {
 	    content_summary: ContentSummary;
 	    is_tool_only: boolean;
 	    is_system: boolean;
+	    is_compact_boundary: boolean;
+	    compact_meta?: CompactMetadata;
 	    model: string;
 	    raw: number[];
 	
@@ -44,6 +204,8 @@ export namespace main {
 	        this.content_summary = this.convertValues(source["content_summary"], ContentSummary);
 	        this.is_tool_only = source["is_tool_only"];
 	        this.is_system = source["is_system"];
+	        this.is_compact_boundary = source["is_compact_boundary"];
+	        this.compact_meta = this.convertValues(source["compact_meta"], CompactMetadata);
 	        this.model = source["model"];
 	        this.raw = source["raw"];
 	    }
@@ -66,13 +228,13 @@ export namespace main {
 		    return a;
 		}
 	}
-	export class Conversation {
+	export class ConversationView {
 	    messages: Message[];
 	    total_size: number;
 	    session_id: string;
 	
 	    static createFrom(source: any = {}) {
-	        return new Conversation(source);
+	        return new ConversationView(source);
 	    }
 	
 	    constructor(source: any = {}) {

@@ -12,17 +12,25 @@ export function BranchNewSession(arg1:string,arg2:string,arg3:string):Promise<st
 
 export function CheckUpdate():Promise<main.UpdateInfo>;
 
+export function CompactToImageApply(arg1:string,arg2:string):Promise<main.CompactToImageResult>;
+
+export function CompactToImagePreview(arg1:string,arg2:string):Promise<main.CompactToImageResult>;
+
 export function DoUpdate(arg1:string):Promise<void>;
 
 export function EditMessage(arg1:string,arg2:string,arg3:string,arg4:string):Promise<void>;
 
 export function ExecClaude(arg1:string,arg2:string,arg3:boolean,arg4:string):Promise<void>;
 
+export function FastCompact(arg1:string,arg2:string,arg3:Array<string>,arg4:boolean):Promise<main.CompactReport>;
+
+export function FixSession(arg1:string,arg2:string):Promise<main.CompactReport>;
+
 export function GetAvailableTerminals():Promise<Array<string>>;
 
 export function GetClaudeCommand(arg1:string,arg2:string,arg3:boolean):Promise<string>;
 
-export function GetConversation(arg1:string,arg2:string):Promise<main.Conversation>;
+export function GetConversation(arg1:string,arg2:string):Promise<main.ConversationView>;
 
 export function GetStartupArgs():Promise<main.StartupArgs>;
 
@@ -41,3 +49,5 @@ export function RestoreSidechain(arg1:string,arg2:string,arg3:string):Promise<vo
 export function SaveConversation(arg1:string,arg2:string,arg3:main.SaveRequest):Promise<main.SaveResult>;
 
 export function SummarizeMessages(arg1:string,arg2:string,arg3:Array<string>):Promise<string>;
+
+export function ValidateSession(arg1:string,arg2:string):Promise<Array<main.ChainIssue>>;
