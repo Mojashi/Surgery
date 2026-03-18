@@ -11,11 +11,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
+	"sync"
+	"unicode/utf8"
 )
 
 //go:embed scripts/html2png
 var html2pngBin []byte
+
+//go:embed scripts/pdf2png
+var pdf2pngBin []byte
 
 // --- Rule: TextToImageRule ---
 // Renders the entire conversation as a chat-style HTML document and converts
@@ -47,7 +51,7 @@ func (r *TextToImageRule) Apply(entries []*JSONLEntry) ([]*JSONLEntry, CompactRu
 
 	// Render to page images
 	chatHTML := buildChatHTML(toRender)
-	pngPages, err := renderHTMLBatch([]string{chatHTML}, nil)
+	pngPages, err := renderHTMLParallel([]string{chatHTML}, nil)
 	if err != nil {
 		report.Details = append(report.Details, fmt.Sprintf("render failed: %v", err))
 		report.BytesAfter = report.BytesBefore
@@ -163,6 +167,10 @@ func buildChatSections(entries []*JSONLEntry) string {
 				if text != "" {
 					sections.WriteString(renderChatBubble(role, html.EscapeString(text)))
 				}
+			case "image":
+				sections.WriteString(renderImageBlock(b))
+			case "document":
+				sections.WriteString(renderDocumentBlock(b))
 			case "tool_use":
 				var name string
 				json.Unmarshal(b["name"], &name)
@@ -170,12 +178,15 @@ func buildChatSections(entries []*JSONLEntry) string {
 				json.Unmarshal(b["input"], &input)
 				sections.WriteString(renderToolBlock("tool_use", formatToolUse(name, input)))
 			case "tool_result":
-				text := extractToolResultText(b["content"])
+				text, images := extractToolResultContent(b["content"])
 				if text != "" {
 					if len(text) > 3000 {
-						text = text[:3000] + "\n... (truncated)"
+						text = truncateUTF8(text, 3000) + "\n... (truncated)"
 					}
 					sections.WriteString(renderToolBlock("tool_result", html.EscapeString(text)))
+				}
+				for _, imgHTML := range images {
+					sections.WriteString(renderToolBlock("tool_result", imgHTML))
 				}
 			}
 		}
@@ -230,6 +241,16 @@ body {
   white-space: pre-wrap;
   word-wrap: break-word;
   color: #333;
+}
+.bubble-img {
+  margin: 2px 0;
+  max-width: 95%%;
+}
+.bubble-img img {
+  max-width: 100%%;
+  height: auto;
+  border-radius: 4px;
+  border: 1px solid #ddd;
 }`
 
 func wrapChatHTML(body string) string {
@@ -265,22 +286,21 @@ func renderHTMLChunksParallel(entries []*JSONLEntry, chunkSize int, progressFn f
 		htmlDocs[i] = wrapChatHTML(buildChatSections(chunk))
 	}
 
-	// Render all chunks in a single batch process (one WKWebView, no repeated compilation)
-	allPages, err := renderHTMLBatch(htmlDocs, progressFn)
+	// Render all chunks in parallel (pre-compiled binary, fast startup)
+	allPages, err := renderHTMLParallel(htmlDocs, progressFn)
 	if err != nil {
 		return nil, err
 	}
 	return allPages, nil
 }
 
-// renderHTMLBatch sends all HTML docs to a single Swift process for batch rendering.
-func renderHTMLBatch(htmlDocs []string, progressFn func(int, int)) ([][]byte, error) {
+// renderHTMLParallel renders each HTML doc in a separate process (parallel).
+func renderHTMLParallel(htmlDocs []string, progressFn func(int, int)) ([][]byte, error) {
 	tmpDir, err := os.MkdirTemp("", "surgery-img-*")
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		// Copy to debug dir
 		debugDir := filepath.Join(os.TempDir(), "surgery-compact-debug")
 		os.MkdirAll(debugDir, 0755)
 		files, _ := os.ReadDir(tmpDir)
@@ -293,58 +313,79 @@ func renderHTMLBatch(htmlDocs []string, progressFn func(int, int)) ([][]byte, er
 		}
 	}()
 
-	// Compile Swift script once (cached)
 	binPath, err := ensureHTML2PNGBinary(tmpDir)
 	if err != nil {
 		return nil, err
 	}
 
-	// Build batch jobs JSON
-	type batchJob struct {
-		HTML   string `json:"html"`
-		Prefix string `json:"prefix"`
-	}
-	var jobs []batchJob
-	for i, html := range htmlDocs {
-		jobs = append(jobs, batchJob{HTML: html, Prefix: fmt.Sprintf("chunk%d", i)})
-	}
-	jobsJSON, _ := json.Marshal(jobs)
-
-	// Run batch
-	start := time.Now()
-	cmd := exec.Command(binPath, tmpDir)
-	cmd.Stdin = bytes.NewReader(jobsJSON)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("html2png batch: %v: %s", err, stderr.String())
-	}
-	fmt.Fprintf(os.Stderr, "  render: %v\n", time.Since(start).Round(time.Millisecond))
-
-	// Collect all pages in chunk order, converting to WebP if possible
 	_, cwebpErr := exec.LookPath("cwebp")
 	hasWebP := cwebpErr == nil
 
-	var allPages [][]byte
-	for i := range htmlDocs {
-		prefix := fmt.Sprintf("chunk%d", i)
-		// Try single page
-		singlePath := filepath.Join(tmpDir, prefix+".png")
-		if _, err := os.Stat(singlePath); err == nil {
-			allPages = append(allPages, convertPage(singlePath, hasWebP))
-		} else {
-			// Multi-page
-			for j := 0; ; j++ {
-				pagePath := filepath.Join(tmpDir, fmt.Sprintf("%s-%d.png", prefix, j))
-				if _, err := os.Stat(pagePath); err != nil {
-					break
-				}
-				allPages = append(allPages, convertPage(pagePath, hasWebP))
+	type chunkResult struct {
+		pages [][]byte
+		err   error
+	}
+	results := make([]chunkResult, len(htmlDocs))
+
+	// Launch chunks in parallel (limited concurrency to avoid overwhelming WindowServer)
+	maxWorkers := 4
+	sem := make(chan struct{}, maxWorkers)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	completed := 0
+
+	for i, html := range htmlDocs {
+		wg.Add(1)
+		go func(idx int, htmlContent string) {
+			sem <- struct{}{}        // acquire
+			defer func() { <-sem }() // release
+			defer wg.Done()
+
+			// Write HTML to chunk-specific file
+			htmlPath := filepath.Join(tmpDir, fmt.Sprintf("chunk%d.html", idx))
+			prefix := filepath.Join(tmpDir, fmt.Sprintf("chunk%d", idx))
+			os.WriteFile(htmlPath, []byte(htmlContent), 0644)
+
+			cmd := exec.Command(binPath, htmlPath, prefix)
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Run(); err != nil {
+				results[idx] = chunkResult{err: fmt.Errorf("chunk %d: %v: %s", idx, err, stderr.String())}
+				return
 			}
+
+			// Collect pages
+			var pages [][]byte
+			singlePath := prefix + ".png"
+			if _, err := os.Stat(singlePath); err == nil {
+				pages = append(pages, convertPage(singlePath, hasWebP))
+			} else {
+				for j := 0; ; j++ {
+					pagePath := fmt.Sprintf("%s-%d.png", prefix, j)
+					if _, err := os.Stat(pagePath); err != nil {
+						break
+					}
+					pages = append(pages, convertPage(pagePath, hasWebP))
+				}
+			}
+			results[idx] = chunkResult{pages: pages}
+
+			mu.Lock()
+			completed++
+			if progressFn != nil {
+				progressFn(completed, len(htmlDocs))
+			}
+			mu.Unlock()
+		}(i, html)
+	}
+	wg.Wait()
+
+	var allPages [][]byte
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
 		}
-		if progressFn != nil {
-			progressFn(i+1, len(htmlDocs))
-		}
+		allPages = append(allPages, r.pages...)
 	}
 	if len(allPages) == 0 {
 		return nil, fmt.Errorf("no output generated")
@@ -352,10 +393,11 @@ func renderHTMLBatch(htmlDocs []string, progressFn func(int, int)) ([][]byte, er
 	return allPages, nil
 }
 
+
 func convertPage(pngPath string, hasWebP bool) []byte {
 	if hasWebP {
 		webpPath := strings.TrimSuffix(pngPath, ".png") + ".webp"
-		cmd := exec.Command("cwebp", "-q", "85", pngPath, "-o", webpPath)
+		cmd := exec.Command("cwebp", "-q", "95", pngPath, "-o", webpPath)
 		if cmd.Run() == nil {
 			if data, err := os.ReadFile(webpPath); err == nil {
 				return data
@@ -383,6 +425,17 @@ func ensureHTML2PNGBinary(_ string) (string, error) {
 	return binPath, nil
 }
 
+// truncateUTF8 truncates s to at most maxBytes without splitting a multi-byte character.
+func truncateUTF8(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
+}
+
 func renderChatBubble(role, content string) string {
 	return fmt.Sprintf(`<div class="role-label">%s</div><div class="bubble %s">%s</div>`+"\n",
 		html.EscapeString(role), html.EscapeString(role), content)
@@ -395,6 +448,170 @@ func renderToolBlock(kind, content string) string {
 	}
 	return fmt.Sprintf(`<div class="role-label">%s</div><div class="tool">%s</div>`+"\n",
 		label, content)
+}
+
+// renderImageBlock renders an image content block as an inline <img> tag.
+func renderImageBlock(b map[string]json.RawMessage) string {
+	var source map[string]string
+	if json.Unmarshal(b["source"], &source) != nil {
+		return ""
+	}
+	mediaType := source["media_type"]
+	data := source["data"]
+	if mediaType == "" || data == "" {
+		return ""
+	}
+	return fmt.Sprintf(`<div class="role-label">image</div><div class="bubble-img"><img src="data:%s;base64,%s"></div>`+"\n",
+		html.EscapeString(mediaType), data)
+}
+
+// renderDocumentBlock renders a document content block (e.g. PDF) by converting
+// its pages to images and embedding them inline.
+func renderDocumentBlock(b map[string]json.RawMessage) string {
+	var source map[string]string
+	if json.Unmarshal(b["source"], &source) != nil {
+		return ""
+	}
+	mediaType := source["media_type"]
+	data := source["data"]
+	if data == "" {
+		return ""
+	}
+
+	// Decode base64 data
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return renderChatBubble("system", html.EscapeString(fmt.Sprintf("[document: %s, decode error]", mediaType)))
+	}
+
+	// Convert PDF to PNG pages
+	if mediaType == "application/pdf" {
+		pages, err := renderPDFToImages(raw)
+		if err != nil {
+			return renderChatBubble("system", html.EscapeString(fmt.Sprintf("[PDF: %d bytes, render error: %v]", len(raw), err)))
+		}
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf(`<div class="role-label">document (%d page(s))</div>`+"\n", len(pages)))
+		for _, pageData := range pages {
+			mt := detectImageMediaType(pageData)
+			b64 := base64.StdEncoding.EncodeToString(pageData)
+			sb.WriteString(fmt.Sprintf(`<div class="bubble-img"><img src="data:%s;base64,%s"></div>`+"\n",
+				html.EscapeString(mt), b64))
+		}
+		return sb.String()
+	}
+
+	// Unknown document type — placeholder
+	return renderChatBubble("system", html.EscapeString(fmt.Sprintf("[document: %s, %d bytes]", mediaType, len(raw))))
+}
+
+// renderPDFToImages converts PDF binary data to PNG page images using the embedded pdf2png binary.
+func renderPDFToImages(pdfData []byte) ([][]byte, error) {
+	tmpDir, err := os.MkdirTemp("", "surgery-pdf-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	binPath, err := ensurePDF2PNGBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	pdfPath := filepath.Join(tmpDir, "input.pdf")
+	if err := os.WriteFile(pdfPath, pdfData, 0644); err != nil {
+		return nil, err
+	}
+
+	prefix := filepath.Join(tmpDir, "page")
+	cmd := exec.Command(binPath, pdfPath, prefix)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, stderr.String())
+	}
+
+	// Collect pages (same logic as html2png output)
+	_, cwebpErr := exec.LookPath("cwebp")
+	hasWebP := cwebpErr == nil
+
+	var pages [][]byte
+	singlePath := prefix + ".png"
+	if _, err := os.Stat(singlePath); err == nil {
+		pages = append(pages, convertPage(singlePath, hasWebP))
+	} else {
+		for i := 0; ; i++ {
+			pagePath := fmt.Sprintf("%s-%d.png", prefix, i)
+			if _, err := os.Stat(pagePath); err != nil {
+				break
+			}
+			pages = append(pages, convertPage(pagePath, hasWebP))
+		}
+	}
+	if len(pages) == 0 {
+		return nil, fmt.Errorf("no output pages generated")
+	}
+	return pages, nil
+}
+
+var pdf2pngBinaryPath string
+
+func ensurePDF2PNGBinary() (string, error) {
+	if pdf2pngBinaryPath != "" {
+		if _, err := os.Stat(pdf2pngBinaryPath); err == nil {
+			return pdf2pngBinaryPath, nil
+		}
+	}
+	binPath := filepath.Join(os.TempDir(), "surgery-pdf2png")
+	if err := os.WriteFile(binPath, pdf2pngBin, 0755); err != nil {
+		return "", err
+	}
+	pdf2pngBinaryPath = binPath
+	return binPath, nil
+}
+
+// extractToolResultContent extracts text and image HTML from a tool_result content field.
+func extractToolResultContent(content json.RawMessage) (string, []string) {
+	// Try as string
+	var s string
+	if json.Unmarshal(content, &s) == nil {
+		return s, nil
+	}
+	// Try as array of blocks
+	var arr []json.RawMessage
+	if json.Unmarshal(content, &arr) != nil {
+		return "", nil
+	}
+	var texts []string
+	var images []string
+	for _, item := range arr {
+		var b map[string]json.RawMessage
+		if json.Unmarshal(item, &b) != nil {
+			continue
+		}
+		var typ string
+		json.Unmarshal(b["type"], &typ)
+		switch typ {
+		case "text":
+			var t string
+			json.Unmarshal(b["text"], &t)
+			texts = append(texts, t)
+		case "image":
+			imgHTML := renderImageBlock(b)
+			if imgHTML != "" {
+				var source map[string]string
+				json.Unmarshal(b["source"], &source)
+				images = append(images, fmt.Sprintf(`<img src="data:%s;base64,%s">`,
+					html.EscapeString(source["media_type"]), source["data"]))
+			}
+		case "document":
+			docHTML := renderDocumentBlock(b)
+			if docHTML != "" {
+				images = append(images, docHTML)
+			}
+		}
+	}
+	return strings.Join(texts, "\n"), images
 }
 
 func formatToolUse(name string, input map[string]any) string {
@@ -411,7 +628,7 @@ func formatToolUse(name string, input map[string]any) string {
 	case "Bash":
 		cmd, _ := input["command"].(string)
 		if len(cmd) > 200 {
-			cmd = cmd[:200] + "..."
+			cmd = truncateUTF8(cmd, 200) + "..."
 		}
 		return html.EscapeString(fmt.Sprintf("Bash: %s", cmd))
 	case "Grep":
@@ -424,7 +641,7 @@ func formatToolUse(name string, input map[string]any) string {
 		b, _ := json.Marshal(input)
 		s := string(b)
 		if len(s) > 200 {
-			s = s[:200] + "..."
+			s = truncateUTF8(s, 200) + "..."
 		}
 		return html.EscapeString(fmt.Sprintf("%s(%s)", name, s))
 	}

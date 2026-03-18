@@ -405,13 +405,18 @@ func runCompactBackground(args []string) {
 		return
 	}
 	beforeCount := conv.EntryCount()
+	beforeTokens := estimateEntryTokens(conv.Entries)
+	if usage, ok := getLastUsage(conv.Entries); ok {
+		beforeTokens = usage.TotalInputTokens()
+	}
 	sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
 
 	rules := selectRules(ruleNames)
 	report := RunCompaction(conv, rules)
 
+	afterTokens := estimateEntryTokens(conv.Entries)
 	var sb strings.Builder
-	formatCompactReport(&sb, filepath.Base(jsonlPath), beforeCount, conv.EntryCount(), report)
+	formatCompactReport(&sb, filepath.Base(jsonlPath), beforeCount, conv.EntryCount(), beforeTokens, afterTokens, report)
 
 	if dryRun {
 		fmt.Fprintln(&sb, "\n(dry run — no changes written)")
@@ -445,12 +450,17 @@ func runCompactOnFile(jsonlPath string, ruleNames []string, dryRun bool) {
 		os.Exit(1)
 	}
 	beforeCount := conv.EntryCount()
+	beforeTokens := estimateEntryTokens(conv.Entries)
+	if usage, ok := getLastUsage(conv.Entries); ok {
+		beforeTokens = usage.TotalInputTokens()
+	}
 
 	rules := selectRules(ruleNames)
 	report := RunCompaction(conv, rules)
 
+	afterTokens := estimateEntryTokens(conv.Entries)
 	sessionID := strings.TrimSuffix(filepath.Base(jsonlPath), ".jsonl")
-	printCompactReport(filepath.Base(jsonlPath), beforeCount, conv.EntryCount(), report)
+	printCompactReport(filepath.Base(jsonlPath), beforeCount, conv.EntryCount(), beforeTokens, afterTokens, report)
 
 	if dryRun {
 		fmt.Println("\n(dry run — no changes written)")
@@ -474,10 +484,10 @@ func runCompactOnFile(jsonlPath string, ruleNames []string, dryRun bool) {
 	fmt.Printf("Original untouched: %s\n", sessionID)
 }
 
-func formatCompactReport(w *strings.Builder, filename string, beforeCount, afterCount int, report CompactReport) {
+func formatCompactReport(w *strings.Builder, filename string, beforeCount, afterCount int, beforeTokens, afterTokens int, report CompactReport) {
 	fmt.Fprintf(w, "Compaction report for %s\n", filename)
-	fmt.Fprintf(w, "  Before: %s (%d entries)\n", humanBytes(report.TotalBefore), beforeCount)
-	fmt.Fprintf(w, "  After:  %s (%d entries)\n", humanBytes(report.TotalAfter), afterCount)
+	fmt.Fprintf(w, "  Before: %s (%d entries, ~%d tokens)\n", humanBytes(report.TotalBefore), beforeCount, beforeTokens)
+	fmt.Fprintf(w, "  After:  %s (%d entries, ~%d tokens)\n", humanBytes(report.TotalAfter), afterCount, afterTokens)
 	fmt.Fprintf(w, "  Saved:  %s (%.1f%%)\n", humanBytes(report.TotalSaved),
 		float64(report.TotalSaved)*100/float64(report.TotalBefore))
 	fmt.Fprintln(w)
@@ -494,9 +504,9 @@ func formatCompactReport(w *strings.Builder, filename string, beforeCount, after
 	}
 }
 
-func printCompactReport(filename string, beforeCount, afterCount int, report CompactReport) {
+func printCompactReport(filename string, beforeCount, afterCount int, beforeTokens, afterTokens int, report CompactReport) {
 	var sb strings.Builder
-	formatCompactReport(&sb, filename, beforeCount, afterCount, report)
+	formatCompactReport(&sb, filename, beforeCount, afterCount, beforeTokens, afterTokens, report)
 	fmt.Print(sb.String())
 }
 
@@ -577,6 +587,10 @@ func (c *CompactApp) RunCompact() map[string]string {
 		return map[string]string{"error": fmt.Sprintf("load error: %v", err)}
 	}
 	beforeCount := conv.EntryCount()
+	beforeTokens := estimateEntryTokens(conv.Entries)
+	if usage, ok := getLastUsage(conv.Entries); ok {
+		beforeTokens = usage.TotalInputTokens()
+	}
 
 	splitIdx := findImageBoundary(conv.Entries)
 	if splitIdx < 2 {
@@ -648,8 +662,8 @@ func (c *CompactApp) RunCompact() map[string]string {
 	}
 
 	afterTokens := estimateEntryTokens(result)
-	reportText := fmt.Sprintf("%d entries → %d entries, %d page images\n~%d tokens",
-		beforeCount, len(result), len(pngPages), afterTokens)
+	reportText := fmt.Sprintf("%d entries → %d entries, %d page images\n~%d tokens → ~%d tokens",
+		beforeCount, len(result), len(pngPages), beforeTokens, afterTokens)
 
 	// Build preview HTML showing all rendered page images
 	var previewBuf strings.Builder

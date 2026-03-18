@@ -8,6 +8,40 @@ import (
 	"image/png"
 )
 
+// messageUsage extracts the usage field from an entry's raw message JSON.
+type messageUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
+func (u messageUsage) TotalInputTokens() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
+
+// getLastUsage finds the usage from the last assistant entry (API-reported token count).
+// Returns the usage and true if found.
+func getLastUsage(entries []*JSONLEntry) (messageUsage, bool) {
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e.Type != "assistant" || e.IsSidechain {
+			continue
+		}
+		rawMsg, ok := e.raw["message"]
+		if !ok {
+			continue
+		}
+		var msg struct {
+			Usage *messageUsage `json:"usage"`
+		}
+		if json.Unmarshal(rawMsg, &msg) == nil && msg.Usage != nil && msg.Usage.TotalInputTokens() > 0 {
+			return *msg.Usage, true
+		}
+	}
+	return messageUsage{}, false
+}
+
 // estimateEntryTokens estimates token count for a list of entries locally.
 // Images: (width * height) / 750 per Anthropic docs.
 // Text: len / 4 (rough average for mixed content).
